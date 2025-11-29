@@ -249,13 +249,13 @@ async def benchmark(
     ramp_up_strategy: Optional[Literal["linear", "exponential"]] = None,
     ramp_up_start_rps: Optional[int] = None,
     ramp_up_end_rps: Optional[int] = None,
+    skip_initial_test: bool = False,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
-    print("Starting initial single prompt test run...")
     test_prompt, test_prompt_len, test_output_len, test_mm_content = (
         input_requests[0].prompt,
         input_requests[0].prompt_len,
@@ -263,28 +263,30 @@ async def benchmark(
         input_requests[0].multi_modal_data,
     )
 
-    assert test_mm_content is None or isinstance(test_mm_content, dict)
-    test_input = RequestFuncInput(
-        model=model_id,
-        model_name=model_name,
-        prompt=test_prompt,
-        api_url=api_url,
-        prompt_len=test_prompt_len,
-        output_len=test_output_len,
-        logprobs=logprobs,
-        multi_modal_content=test_mm_content,
-        ignore_eos=ignore_eos,
-        extra_body=extra_body,
-    )
-
-    test_output = await request_func(request_func_input=test_input)
-    if not test_output.success:
-        raise ValueError(
-            "Initial test run failed - Please make sure benchmark arguments "
-            f"are correctly specified. Error: {test_output.error}"
+    if not skip_initial_test:
+        print("Starting initial single prompt test run...")
+        assert test_mm_content is None or isinstance(test_mm_content, dict)
+        test_input = RequestFuncInput(
+            model=model_id,
+            model_name=model_name,
+            prompt=test_prompt,
+            api_url=api_url,
+            prompt_len=test_prompt_len,
+            output_len=test_output_len,
+            logprobs=logprobs,
+            multi_modal_content=test_mm_content,
+            ignore_eos=ignore_eos,
+            extra_body=extra_body,
         )
-    else:
-        print("Initial test run completed. Starting main benchmark run...")
+
+        test_output = await request_func(request_func_input=test_input)
+        if not test_output.success:
+            raise ValueError(
+                "Initial test run failed - Please make sure benchmark arguments "
+                f"are correctly specified. Error: {test_output.error}"
+            )
+        else:
+            print("Initial test run completed. Starting main benchmark run...")
 
     if lora_modules:
         # For each input request, choose a LoRA module at random.
@@ -820,6 +822,7 @@ def main(args: argparse.Namespace):
             ramp_up_strategy=args.ramp_up_strategy,
             ramp_up_start_rps=args.ramp_up_start_rps,
             ramp_up_end_rps=args.ramp_up_end_rps,
+            skip_initial_test=args.skip_initial_test,
         )
     )
 
@@ -1279,6 +1282,11 @@ def create_argument_parser():
         default=None,
         help="The ending request rate for ramp-up (RPS). "
         "Needs to be specified when --ramp-up-strategy is used.",
+    )
+    parser.add_argument(
+        "--skip-initial-test",
+        action="store_true",
+        help="Skip the initial single prompt test run.",
     )
 
     return parser

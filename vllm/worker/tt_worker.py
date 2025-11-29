@@ -24,6 +24,8 @@ from vllm.worker.worker_base import (LocalOrDistributedWorkerBase,
                                      LoRANotSupportedWorkerBase, WorkerBase,
                                      WorkerInput)
 
+from vllm.worker.tt_device import create_mesh_device
+
 logger = init_logger(__name__)
 
 
@@ -587,7 +589,8 @@ def get_mesh_grid(local_dp_rank=0):
         "P150x4": (1, 4),
         "T3K": (1, 8),
         "P150x8": (1, 8),
-        "TG": (8, 4)
+        "TG": (8, 4),
+        "TG_MOREH": (4, 8)
     }
     mesh_device_env = os.environ.get("MESH_DEVICE")
     if mesh_device_env is not None:
@@ -621,20 +624,23 @@ def open_mesh_device(override_tt_config, trace_mode, local_dp_rank=0):
     mesh_grid = get_mesh_grid(local_dp_rank)
     logger.info("Attempting to open mesh device with grid shape %s", mesh_grid)
 
-    device_params = device_params_from_override_tt_config(
-        override_tt_config, trace_mode)
+    # device_params = device_params_from_override_tt_config(
+    #     override_tt_config, trace_mode)
 
     # Set fabric before opening the device
     num_devices_requested = mesh_grid[0] * mesh_grid[1]
     set_fabric(override_tt_config, num_devices_requested)
 
-    mesh_device = ttnn.open_mesh_device(
-        ttnn.MeshShape(*mesh_grid),
-        dispatch_core_config=get_dispatch_core_config(override_tt_config),
-        **device_params,
-    )
-    logger.info("multidevice with %d devices and grid %s is created",
-                mesh_device.get_num_devices(), mesh_grid)
+    # mesh_device = ttnn.open_mesh_device(
+    #     ttnn.MeshShape(*mesh_grid),
+    #     dispatch_core_config=get_dispatch_core_config(override_tt_config),
+    #     **device_params,
+    # )
+    device_params = {"trace_region_size": 95449088, "fabric_config": ttnn.FabricConfig.FABRIC_1D_RING}
+    mesh_device = create_mesh_device(device_params)
+    # set_and_get_device_cache(mesh_device)
+    # logger.info("multidevice with %d devices and grid %s is created",
+    #             mesh_device.get_num_devices(), mesh_grid)
     return mesh_device
 
 

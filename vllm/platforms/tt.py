@@ -56,7 +56,10 @@ def register_tt_models():
     # Qwen2.5 - Text
     path_qwen_text = "models.tt_transformers.tt.generator_vllm:QwenForCausalLM"
     ModelRegistry.register_model("TTQwen2ForCausalLM", path_qwen_text)
-    ModelRegistry.register_model("TTQwen3ForCausalLM", path_qwen_text)
+    
+    # Qwen3
+    path_qwen3_text = "models.demos.qwen3.tt.generator_vllm:Qwen3ForCausalLM"
+    ModelRegistry.register_model("TTQwen3MoeForCausalLM", path_qwen3_text)
 
     # Qwen2.5 - Vision
     ModelRegistry.register_model(
@@ -131,6 +134,7 @@ def check_tt_model_supported(model):
         "openai/gpt-oss-20b",
         "openai/gpt-oss-120b",
         "deepseek-ai/DeepSeek-R1-0528",
+        "Qwen/Qwen3-235B-A22B",
     ]
     assert model in supported_models, (
         f"{model} is not in list of supported TT models")
@@ -247,6 +251,10 @@ class TTPlatform(Platform):
 
         if model_class.__module__.startswith(
                 "models.tt_transformers.tt.generator_vllm"):
+            cls.non_greedy_decoding_on_device = True  # type: ignore[attr-defined]
+
+        if model_class.__module__.startswith(
+                "models.demos.qwen3.tt.generator_vllm"):
             cls.non_greedy_decoding_on_device = True  # type: ignore[attr-defined]
 
     @classmethod
