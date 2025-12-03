@@ -134,6 +134,7 @@ def check_tt_model_supported(model):
         "openai/gpt-oss-20b",
         "openai/gpt-oss-120b",
         "deepseek-ai/DeepSeek-R1-0528",
+        "Qwen/Qwen3-30B-A3B",
         "Qwen/Qwen3-235B-A22B",
     ]
     assert model in supported_models, (
@@ -188,6 +189,10 @@ class TTPlatform(Platform):
         for i in range(len(arch_names)):
             if not arch_names[i].startswith("TT"):
                 arch_names[i] = "TT" + arch_names[i]
+
+        cache_config = vllm_config.cache_config
+        if cache_config and cache_config.block_size is None:
+            cache_config.block_size = 128
 
         # Setting attributes on the class level is kind of hacky, but
         # it's the only way to make validate_request depend on vllm_config

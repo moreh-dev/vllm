@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import math
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Set, Type, Union
 
@@ -179,8 +180,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             self.cached_req_data: Dict[int, Dict[str, Any]] = {}
             self.previous_seq_ids: Set[int] = set()
 
-        vocab_size = self.model_config.get_vocab_size()
-        self.logits_processor = LogitsProcessor(vocab_size,
+        self.vocab_size = self.model_config.get_vocab_size()
+        self.logits_processor = LogitsProcessor(self.vocab_size,
                                                 logits_as_input=True)
         # We are relying on having our logits shaped correctly,
         # as if they came from a regular vLLM model
@@ -832,6 +833,51 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 CompletionSequenceGroupOutput(seq_outputs, None))
         return SamplerOutput(sampler_outputs)
 
+    def _extract_last_token_logits(self, logits_tensor: torch.Tensor,
+                                   unpadded_batch_size: int) -> torch.Tensor:
+        vocab_size = self.vocab_size
+
+        if logits_tensor.ndim == 3:
+            return logits_tensor[:unpadded_batch_size, -1, :]
+
+        if logits_tensor.ndim == 2:
+            last_dim = logits_tensor.shape[-1]
+            if last_dim == vocab_size:
+                return logits_tensor[:unpadded_batch_size, :]
+            if last_dim % vocab_size == 0:
+                seq_len = last_dim // vocab_size
+                reshaped = logits_tensor.view(logits_tensor.shape[0], seq_len, vocab_size)
+                return reshaped[:unpadded_batch_size, -1, :]
+            return logits_tensor[:unpadded_batch_size, :]
+
+        if logits_tensor.ndim == 1:
+            reshaped = self._reshape_flat_logits(logits_tensor, unpadded_batch_size)
+            return reshaped[:unpadded_batch_size, -1, :]
+
+        raise ValueError(f"{tuple(logits_tensor.shape)=}")
+
+    def _reshape_flat_logits(self, logits_tensor: torch.Tensor,
+                             unpadded_batch_size: int) -> torch.Tensor:
+        vocab_size = self.vocab_size
+        total = logits_tensor.numel()
+        remainder = total % vocab_size
+        if remainder != 0:
+            pad = vocab_size - remainder
+            logits_tensor = F.pad(logits_tensor, (0, pad))
+            total += pad
+
+        seq_prod = total // vocab_size
+        if seq_prod == 0:
+            return logits_tensor.view(0, 1, vocab_size)
+
+        reshaped = logits_tensor.view(seq_prod, 1, vocab_size)
+
+        if seq_prod < unpadded_batch_size:
+            repeat_factor = math.ceil(unpadded_batch_size / seq_prod)
+            reshaped = reshaped.repeat(repeat_factor, 1, 1)
+
+        return reshaped
+
     def _send_prev_step_async_out(self, model_input: TTModelInput, step_idx):
         if step_idx > 0:
             step_output = self.cached_step_outputs.pop(0)
@@ -1072,10 +1118,15 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 if self.dp_kv_cache:
                     tt_out = tt_out[perm_table_tensor]
 
+        def _unwrap_logits(output):
+            if isinstance(output, tuple):
+                return output[0]
+            return output
+
         if model_input.compat_sampling_used:
             # compat sampling is only supported on host
-            tt_logits = tt_out[:model_input.unpadded_batch_size,
-                               -1, :]  # [unpadded batch, vocab]
+            tt_logits = self._extract_last_token_logits(
+                _unwrap_logits(tt_out), model_input.unpadded_batch_size)
             #This is coincidentally the same shape as the logits
             # we would get from a regular vllm model,
             # assuming we have no prompt logprobs, and one sequence per group.
@@ -1095,7 +1146,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         else:
             if not model_input.perform_device_sampling:
                 # unpadded batch, vocab of last token
-                next_logits = tt_out[:model_input.unpadded_batch_size, -1, :]
+                next_logits = self._extract_last_token_logits(
+                    _unwrap_logits(tt_out), model_input.unpadded_batch_size)
                 assert model_input.tt_sampling_params is not None
                 assert isinstance(
                     model_input.tt_sampling_params, TTSamplingParams), (
