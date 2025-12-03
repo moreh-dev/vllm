@@ -17,4 +17,4 @@ export TEST_DATASET_PATH="/mnt/nvme3/Qwen3-235B-A22B/test_dataset.json" # path t
 export MOE_IMPL="snu" # "snu" or "tt"
 export MOE_MATMUL_IMPL="moreh_moe_bmm" # "moreh_moe_bmm" or "ttnn.matmul"
 
-MESH_DEVICE=TG_MOREH python examples/server_example_tt.py --model Qwen/Qwen3-235B-A22B --max_model_len 128 --max_num_seqs 128 --override_tt_config '{"sample_on_device_mode": "all"}'
+MESH_DEVICE=TG_MOREH python examples/server_example_tt.py --model Qwen/Qwen3-235B-A22B --max_model_len 128 --max_num_seqs 128 --override_tt_config '{"sample_on_device_mode": "all"}' --num_scheduler_steps 1
