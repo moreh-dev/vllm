@@ -541,6 +541,7 @@ def set_fabric(override_tt_config, num_devices):
         logger.info("Setting fabric config: %s, reliability mode: %s",
                     fabric_config, reliability_mode)
         ttnn.set_fabric_config(fabric_config, reliability_mode)
+    return fabric_config
 
 
 # From tt-metal/conftest.py:
@@ -629,14 +630,16 @@ def open_mesh_device(override_tt_config, trace_mode, local_dp_rank=0):
 
     # Set fabric before opening the device
     num_devices_requested = mesh_grid[0] * mesh_grid[1]
-    set_fabric(override_tt_config, num_devices_requested)
+    fabric_config = set_fabric(override_tt_config, num_devices_requested)
 
     # mesh_device = ttnn.open_mesh_device(
     #     ttnn.MeshShape(*mesh_grid),
     #     dispatch_core_config=get_dispatch_core_config(override_tt_config),
     #     **device_params,
     # )
-    device_params = {"trace_region_size": 95449088, "fabric_config": ttnn.FabricConfig.FABRIC_1D_RING}
+    device_params = {"trace_region_size": 95449088}
+    if fabric_config:
+        device_params["fabric_config"] = fabric_config
     mesh_device = create_mesh_device(device_params)
     # set_and_get_device_cache(mesh_device)
     # logger.info("multidevice with %d devices and grid %s is created",
