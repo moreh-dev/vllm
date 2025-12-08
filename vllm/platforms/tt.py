@@ -134,6 +134,7 @@ def check_tt_model_supported(model):
         "openai/gpt-oss-20b",
         "openai/gpt-oss-120b",
         "deepseek-ai/DeepSeek-R1-0528",
+        "Qwen/Qwen3-30B-A3B",
         "Qwen/Qwen3-235B-A22B",
     ]
     assert model in supported_models, (
