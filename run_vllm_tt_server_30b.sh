@@ -7,7 +7,7 @@ source /home/jungwook/tt-metal_moreh/python_env/bin/activate
 
 export VLLM_TARGET_DEVICE="tt"
 
-export TT_TRACE=0 # enable trace on decode
+export TT_TRACE=1 # enable trace on decode
 export TT_ENABLE_MATERIALIZE=1 # dynamic load
 export TT_MESHDEVICE_SHAPE=4,8 # mesh device shape
 export QWEN3_MODEL="Qwen3-30B-A3B" # folder that contains the model files
