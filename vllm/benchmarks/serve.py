@@ -1125,9 +1125,9 @@ async def benchmark(
         if max_concurrency is not None:
             print("{:<40} {:<10}".format("Maximum request concurrency:",
                                         max_concurrency))
-        # if request_rate != float('inf'):
-        #     print("{:<40} {:<10.2f}".format("Request rate configured (RPS):",
-        #                                     request_rate))
+        if request_rate != float('inf'):
+            print("{:<40} {:<10.2f}".format("Request rate configured (RPS):",
+                                            request_rate))
         # if request_rate_per_time > 0.0:
         #     print("{:<40} {:<10.2f}".format("Uniform request time (s):",
         #                                     request_rate_per_time))
@@ -1152,10 +1152,10 @@ async def benchmark(
         #         ft_metrics.max_output_tokens_per_s))
         #     print("{:<40} {:<10.2f}".format("Peak concurrent requests:",
         #                                     ft_metrics.max_concurrent_requests))
-        print("{:<40} {:<10.2f}".format("Total Token throughput (tok/s):",
-                                        ft_metrics.total_token_throughput))
         print("{:<40} {:<10.2f}".format(
                 "Output token throughput (tok/s):", num_counted_tokens / t_duration))
+        print("{:<40} {:<10.2f}".format("Total Token throughput (tok/s):",
+                                        (ft_metrics.total_input+num_counted_tokens) / t_duration))
 
         t_result = {
             "duration": t_duration,
