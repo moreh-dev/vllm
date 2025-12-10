@@ -1469,6 +1469,13 @@ def add_dataset_parser(parser: FlexibleArgumentParser):
     # group for dataset specific arguments
     custom_group = parser.add_argument_group("custom dataset options")
     custom_group.add_argument(
+        "--custom-input-len",
+        type=int,
+        default=None,
+        help=
+        "Number of input tokens per request, used only for custom dataset.",
+    )
+    custom_group.add_argument(
         "--custom-output-len",
         type=int,
         default=256,
@@ -1761,6 +1768,7 @@ def get_samples(args, tokenizer) -> list[SampleRequest]:
         input_requests = dataset.sample(
             num_requests=args.num_prompts,
             tokenizer=tokenizer,
+            input_len=args.custom_input_len,
             output_len=args.custom_output_len,
             skip_chat_template=args.skip_chat_template,
             request_id_prefix=args.request_id_prefix,
@@ -2101,6 +2109,7 @@ class CustomDataset(BenchmarkDataset):
         num_requests: int,
         lora_path: str | None = None,
         max_loras: int | None = None,
+        input_len: int | None = None,
         output_len: int | None = None,
         enable_multimodal_chat: bool = False,
         skip_chat_template: bool = False,
@@ -2132,7 +2141,14 @@ class CustomDataset(BenchmarkDataset):
                     tokenize=False,
                 )
 
-            prompt_len = len(tokenizer(prompt).input_ids)
+            prompt_ids = tokenizer(prompt).input_ids
+            prompt_len = len(prompt_ids)
+            _cond = (prompt_len > input_len) if input_len != None else False
+            if _cond:
+                if (prompt_len < input_len):
+                    continue
+                prompt = tokenizer.decode(prompt_ids[:input_len])
+                prompt_len = min(input_len, len(prompt_ids))
             sampled_requests.append(
                 SampleRequest(
                     prompt=prompt,
