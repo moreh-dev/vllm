@@ -20,15 +20,17 @@ import json
 import logging
 import math
 import random
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass
+from datasets import load_dataset
 from functools import cache
 from io import BytesIO
 from tempfile import NamedTemporaryFile
-from typing import Any, cast
+from typing import Any, Callable, List, Optional, Union, cast
 
 import numpy as np
 from PIL import Image
@@ -1288,6 +1290,104 @@ class ShareGPTDataset(BenchmarkDataset):
         )
         return samples
 
+# -----------------------------------------------------------------------------
+# Project Gutenberg Dataset Implementation
+# -----------------------------------------------------------------------------
+
+
+class GutenbergDataset(BenchmarkDataset):
+    """
+    Implements the Gutenberg dataset.  Loads data from a text file and generates
+    sample requests.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.load_data()
+
+    def load_data(self) -> None:
+        """Load data from HuggingFace datasets."""
+        self.data = load_dataset(self.dataset_path, split="en", streaming=True)
+        self.data = self.data.shuffle(seed=self.random_seed)
+
+    def clean_gutenberg_text(self, text: str) -> str:
+        """
+        Basic cleaning for Project Gutenberg text:
+        - Extract content between "*** START OF ..." and "*** END OF ..." markers (if available)
+        - Normalize whitespace and multiple newlines
+        - Trim leading/trailing spaces
+        """
+        # Extract content inside START/END markers
+        start_match = re.search(r"\*\*\* START OF.*?\*\*\*", text, re.IGNORECASE | re.DOTALL)
+        end_match   = re.search(r"\*\*\* END OF.*?\*\*\*", text, re.IGNORECASE | re.DOTALL)
+
+        if start_match and end_match:
+            content = text[start_match.end(): end_match.start()]
+        else:
+            # Use entire raw text if markers are missing
+            content = text
+
+        # Normalize newlines
+        content = content.replace("\r\n", "\n").replace("\r", "\n")
+        # Reduce consecutive blank lines and spaces
+        content = re.sub(r"\n{2,}", "\n\n", content)
+        content = re.sub(r"[ \t]{2,}", " ", content)
+        # Strip spaces
+        content = content.strip()
+        return content
+
+    def chunk_tokens(self, input_ids: List[int], input_len: int = 4000) -> List[List[int]]:
+        """
+        Split a list of token IDs into chunks of size `chunk_size`.
+        """
+        return [
+            input_ids[i : i + input_len]
+            for i in range(0, len(input_ids), input_len)
+        ]
+    def sample(
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        num_requests: int,
+        input_len: int,
+        output_len: int,
+        request_id_prefix: str = "",
+        no_oversample: bool = False,
+        **kwargs,
+    ) -> list:
+        samples = []
+        ind = 0
+
+        for book_idx, book in enumerate(self.data):
+            if len(samples) >= num_requests:
+                break
+            text = book["text"]
+            text = self.clean_gutenberg_text(text)
+            input_ids = tokenizer(text).input_ids
+            chunks = self.chunk_tokens(input_ids, input_len)
+            for i in range(0, len(chunks)):
+                if len(samples) >= num_requests:
+                    break
+                prompt = tokenizer.decode(chunks[i])
+                prompt_len = len(chunks[i])
+                # FOR DEBUG
+                #print(f"{prompt_len=}")
+                #print(f"{prompt=}\n")
+                samples.append(
+                    SampleRequest(
+                        prompt=prompt,
+                        prompt_len=prompt_len,
+                        expected_output_len=output_len,
+                        multi_modal_data=None,
+                        request_id=request_id_prefix + str(ind),
+                    ))
+                ind += 1
+
+        self.maybe_oversample_requests(samples,
+                                        num_requests,
+                                        request_id_prefix,
+                                        no_oversample)
+        return samples
+
 
 class _ValidateDatasetArgs(argparse.Action):
     """Argparse action to validate dataset name and path compatibility."""
@@ -1333,6 +1433,7 @@ def add_dataset_parser(parser: FlexibleArgumentParser):
             "custom",
             "prefix_repetition",
             "spec_bench",
+            "gutenberg"
         ],
         help="Name of the dataset to benchmark on.",
     )
@@ -1346,7 +1447,7 @@ def add_dataset_parser(parser: FlexibleArgumentParser):
         type=str,
         default=None,
         action=_ValidateDatasetArgs,
-        help="Path to the sharegpt/sonnet dataset. "
+        help="Path to the sharegpt/sonnet/gutenberg dataset. "
         "Or the huggingface dataset ID if using HF dataset.",
     )
     parser.add_argument(
@@ -1415,6 +1516,22 @@ def add_dataset_parser(parser: FlexibleArgumentParser):
         default=None,
         help="Output length for each request. Overrides the output length "
         "from the ShareGPT dataset.",
+    )
+
+    gutenberg_group = parser.add_argument_group("gutenberg dataset options")
+    gutenberg_group.add_argument(
+        "--gutenberg-input-len",
+        type=int,
+        default=None,
+        help="Input length for each request. Overrides the input length "
+        "from the Gutenberg dataset.",
+    )
+    gutenberg_group.add_argument(
+        "--gutenberg-output-len",
+        type=int,
+        default=None,
+        help="Output length for each request. Overrides the output length "
+        "from the Gutenberg dataset.",
     )
 
     blazedit_group = parser.add_argument_group("blazedit dataset options")
@@ -1825,6 +1942,16 @@ def get_samples(args, tokenizer) -> list[SampleRequest]:
                 tokenizer=tokenizer,
                 num_requests=args.num_prompts,
                 output_len=args.sharegpt_output_len,
+                request_id_prefix=args.request_id_prefix,
+                no_oversample=args.no_oversample,
+            ),
+            "gutenberg": lambda: GutenbergDataset(
+                random_seed=args.seed, dataset_path=args.dataset_path
+            ).sample(
+                tokenizer=tokenizer,
+                num_requests=args.num_prompts,
+                input_len=args.gutenberg_input_len,
+                output_len=args.gutenberg_output_len,
                 request_id_prefix=args.request_id_prefix,
                 no_oversample=args.no_oversample,
             ),
