@@ -813,7 +813,10 @@ async def benchmark(
     print(f"num_workers: {num_workers}")
 
     pbar_q = Queue()
+    start_time = time.time()
     benchmark_start_time = time.perf_counter()
+    ts = datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M:%S')
+    print("Started at ", ts)
 
     if num_workers > 0:
         output_q = Queue()
@@ -878,6 +881,9 @@ async def benchmark(
 
     benchmark_end_time = time.perf_counter()
     benchmark_duration = benchmark_end_time - benchmark_start_time
+    end_time = time.time()
+    ts = datetime.fromtimestamp(end_time).strftime('%Y-%m-%d %H:%M:%S')
+    print("Finished at ", ts)
 
     if warmup_time == 0 and cooldown_time == 0:
         if task_type == TaskType.GENERATION:

@@ -65,6 +65,8 @@ try:
 except ImportError:
     from argparse import ArgumentParser as FlexibleArgumentParser
 
+from rich.progress import Progress
+
 logger = logging.getLogger(__name__)
 
 # -----------------------------------------------------------------------------
@@ -1357,6 +1359,12 @@ class GutenbergDataset(BenchmarkDataset):
         samples = []
         ind = 0
 
+        pbar = Progress()
+        task_id = pbar.add_task(
+            description="Preparing input prompts...",
+            total=num_requests,
+        )
+        pbar.start()
         for book_idx, book in enumerate(self.data):
             if len(samples) >= num_requests:
                 break
@@ -1364,7 +1372,7 @@ class GutenbergDataset(BenchmarkDataset):
             text = self.clean_gutenberg_text(text)
             input_ids = tokenizer(text).input_ids
             chunks = self.chunk_tokens(input_ids, input_len)
-            for i in range(0, len(chunks)):
+            for i in range(0, len(chunks)-1):
                 if len(samples) >= num_requests:
                     break
                 prompt = tokenizer.decode(chunks[i])
@@ -1380,8 +1388,17 @@ class GutenbergDataset(BenchmarkDataset):
                         multi_modal_data=None,
                         request_id=request_id_prefix + str(ind),
                     ))
+                pbar.update(task_id=task_id, advance=1)
                 ind += 1
 
+        completed = pbar.tasks[task_id].completed
+        if completed < num_requests:
+            print(
+                f"Not enough compatible requests ({completed}/{num_requests}). "
+                f"Start oversampling..."
+            )
+            pbar.update(task_id=task_id, advance=(num_requests-completed))
+        pbar.stop()
         self.maybe_oversample_requests(samples,
                                         num_requests,
                                         request_id_prefix,
@@ -2127,11 +2144,27 @@ class CustomDataset(BenchmarkDataset):
                 num_requests,
             )
 
+        pbar = Progress()
+        task_id = pbar.add_task(description="Preparing input prompts...", total=num_requests)
+        pbar.start()
         sampled_requests = []
         for i, item in enumerate(self.data):
             if len(sampled_requests) >= num_requests:
                 break
+
             prompt = item["prompt"]
+            if prompt is None:
+                continue
+
+            prompt_ids = tokenizer(prompt).input_ids
+            prompt_len = len(prompt_ids)
+            if prompt_len >= input_len:
+                if (prompt_len < input_len):
+                    continue
+                prompt = tokenizer.decode(prompt_ids[:input_len])
+                prompt_len = input_len
+            else:
+                continue
 
             # apply template
             if not skip_chat_template:
@@ -2140,15 +2173,8 @@ class CustomDataset(BenchmarkDataset):
                     add_generation_prompt=True,
                     tokenize=False,
                 )
+                prompt_len = len(tokenizer(prompt).input_ids)
 
-            prompt_ids = tokenizer(prompt).input_ids
-            prompt_len = len(prompt_ids)
-            _cond = (prompt_len > input_len) if input_len != None else False
-            if _cond:
-                if (prompt_len < input_len):
-                    continue
-                prompt = tokenizer.decode(prompt_ids[:input_len])
-                prompt_len = min(input_len, len(prompt_ids))
             sampled_requests.append(
                 SampleRequest(
                     prompt=prompt,
@@ -2157,6 +2183,12 @@ class CustomDataset(BenchmarkDataset):
                     request_id=request_id_prefix + str(i),
                 )
             )
+            pbar.update(task_id=task_id, advance=1)
+        completed = pbar.tasks[task_id].completed
+        if completed < num_requests:
+            print(f"Not enough compatible requests ({completed}/{num_requests}). Start oversampling...")
+            pbar.update(task_id=task_id, advance=(num_requests-completed))
+        pbar.stop()
         self.maybe_oversample_requests(
             sampled_requests, num_requests, request_id_prefix, no_oversample
         )
