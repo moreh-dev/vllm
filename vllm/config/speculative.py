@@ -146,6 +146,18 @@ class SpeculativeConfig:
     tokens with estimated probability (based on frequency counts) greater than
     or equal to this value."""
 
+    # dump hidden states
+    dump_hidden_states: bool = False
+    """Whether to dump hidden state."""
+    hidden_states_dump_path: str | None = None
+    """The path to dump hidden states."""
+    accept_rate_threshold: float = 1.0
+    """Dump hidden states only when acceptance rate is blelow this threshold."""
+    dump_worker_num: int = 1
+    """Number of workers to dump hidden states."""
+    dump_buffer_pool_size: int = 64
+    """Size of the buffer pool for dumping hidden states."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,

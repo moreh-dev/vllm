@@ -154,7 +154,7 @@ from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
     check_ubatch_thresholds,
 )
-from vllm.v1.worker.utils import is_residual_scattered_for_sp
+from vllm.v1.worker.utils import is_residual_scattered_for_sp, HiddenStateDumper
 
 from .utils import (
     AttentionGroup,
@@ -598,6 +598,10 @@ class GPUModelRunner(
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
+
+        # hidden state dumper
+        if self.speculative_config.dump_hidden_states:
+            self.hidden_state_dumper = HiddenStateDumper(self.speculative_config)
 
     def reset_mm_cache(self) -> None:
         if self.mm_budget:
@@ -2871,6 +2875,10 @@ class GPUModelRunner(
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with record_function_or_nullcontext("gpu_model_runner: preprocess"):
             with self.synchronize_input_prep():
+                if self.speculative_config.dump_hidden_states:
+                    for rid in scheduler_output.finished_req_ids:
+                        self.hidden_state_dumper.dump_if_needed(self.requests[rid], rid)
+                        self.hidden_state_dumper.release_request_buffer(rid)
                 # Update persistent batch states.
                 self._update_states(scheduler_output)
 
@@ -3215,6 +3223,16 @@ class GPUModelRunner(
                 scheduler_output.total_num_scheduled_tokens,
                 spec_decode_metadata,
             )
+
+        if self.speculative_config.dump_hidden_states:
+            self.hidden_state_dumper.prepare_payload(
+                req_ids_output_copy,
+                scheduler_output,
+                sampler_output.sampled_token_ids,
+                aux_hidden_states,
+                hidden_states,
+            )
+            self.hidden_state_dumper.process_dump_payload()
 
         if (
             self.speculative_config

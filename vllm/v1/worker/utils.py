@@ -1,13 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections import defaultdict
+import os
+from collections import defaultdict, deque
+from concurrent import futures
 from dataclasses import dataclass, field
+from typing import List
 
+import numpy as np
 import torch
 
 from vllm.attention.backends.abstract import AttentionBackend
 from vllm.attention.layer import Attention
-from vllm.config import ModelConfig, SchedulerConfig, VllmConfig
+from vllm.config import (ModelConfig, SchedulerConfig, SpeculativeConfig,
+                         VllmConfig)
+from vllm.distributed.parallel_state import (
+    get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size)
 from vllm.model_executor.models.interfaces import MultiModalEmbeddings
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.multimodal.cache import processor_only_cache_from_config
@@ -15,7 +22,9 @@ from vllm.multimodal.registry import MultiModalRegistry
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.utils import AttentionMetadataBuilder
 from vllm.v1.core.encoder_cache_manager import compute_mm_encoder_budget
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheGroupSpec, KVCacheSpec
+from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 
 class MultiModalBudget:
@@ -363,3 +372,257 @@ def is_residual_scattered_for_sp(
     if compile_sizes is None:
         return False
     return num_input_tokens in compile_sizes
+
+
+@dataclass
+class HiddenStateDumpPayload:
+    rids: List[str]
+    aux_hidden_states: torch.Tensor
+    last_hidden_states: torch.Tensor
+    num_scheduled_tokens: List[int]
+    accept_length_per_req_cpu: List[int]
+
+@dataclass
+class HiddenStateForDump:
+    aux_hidden_states_for_dump: torch.Tensor
+    hidden_states_for_dump: torch.Tensor
+
+class HiddenStateDumper:
+    def __init__(self, speculative_config: SpeculativeConfig):
+        self.dump_path: str = speculative_config.hidden_states_dump_path
+        self.accept_rate_threshold: float = speculative_config.accept_rate_threshold
+        self.num_speculative_tokens = speculative_config.num_speculative_tokens
+        self.tp_rank: int = get_tensor_model_parallel_rank()
+        self.tp_size: int = get_tensor_model_parallel_world_size()
+        self.dump_stream = torch.cuda.Stream()
+        self.buffer_pool = FlatBufferPool(
+            available_size=speculative_config.dump_buffer_pool_size
+        )
+        self.hidden_state_buffer_map = {}
+        self.dump_executor = futures.ThreadPoolExecutor(
+            max_workers=speculative_config.dump_worker_num,
+        )
+        self.dump_worker_idx: int = -1
+        self.payloads: HiddenStateDumpPayload = None
+        self.dump_tokens = {}
+        self.verify_cnt = {}
+
+        os.makedirs(self.dump_path, exist_ok=True)
+
+    def prepare_payload(
+        self,
+        rids: List[str],
+        scheduler_output: SchedulerOutput,
+        sampled_token_ids: torch.Tensor,
+        aux_hidden_states: List[torch.Tensor],
+        last_hidden_states: torch.Tensor,
+    ):
+        prefill_rids = set()
+        tokens = [scheduler_output.num_scheduled_tokens[i] for i in rids]
+        num_scheduled_tokens = np.array(tokens, dtype=np.int32)
+        for new_req in scheduler_output.scheduled_new_reqs:
+            prefill_rids.add(new_req.req_id)
+        accept_length_per_req = []
+        sampled_token_ids = sampled_token_ids.cpu()
+        for i, rid in enumerate(rids):
+            if rid in prefill_rids:
+                accept_len = num_scheduled_tokens[i]
+            else:
+                accept_len = torch.sum(
+                    sampled_token_ids[i] != -1
+                ).item()  # -1 indicates invalid token
+            accept_length_per_req.append(accept_len)
+
+        aux_hidden_states = torch.cat(aux_hidden_states, dim=-1)
+        self.payloads = HiddenStateDumpPayload(
+            rids=rids,
+            aux_hidden_states=aux_hidden_states,
+            last_hidden_states=last_hidden_states,
+            num_scheduled_tokens=num_scheduled_tokens,
+            accept_length_per_req_cpu=accept_length_per_req,
+        )
+
+    def process_dump_payload(self):
+        if self.payloads is None:
+            return
+
+        rids = self.payloads.rids
+        aux_hidden_states = self.payloads.aux_hidden_states
+        last_hidden_states = self.payloads.last_hidden_states
+        num_scheduled_tokens = self.payloads.num_scheduled_tokens
+        accept_length_per_req_cpu = self.payloads.accept_length_per_req_cpu
+        with torch.cuda.stream(self.dump_stream):
+            aux_hidden_states = aux_hidden_states.cpu()
+            last_hidden_states = last_hidden_states.cpu()
+
+        offset = 0
+        for i, rid in enumerate(rids):
+            if rid not in self.dump_tokens:
+                self.dump_tokens[rid] = 0
+                self.verify_cnt[rid] = -1 # -1 for first prefill
+            scheduled_len = num_scheduled_tokens[i]
+            accept_len = accept_length_per_req_cpu[i]
+            self.append_req_hidden_states(
+                rid,
+                aux_hidden_states[offset : offset + accept_len],
+                last_hidden_states[offset : offset + accept_len],
+            )
+            offset += scheduled_len
+
+        self.payloads = None
+
+    def release_request_buffer(self, rid: str):
+        self.hidden_state_buffer_map.pop(rid)
+        self.buffer_pool.release_buffer(f"{rid}_hs")
+        self.buffer_pool.release_buffer(f"{rid}_lhs")
+        self.dump_tokens.pop(rid)
+        self.verify_cnt.pop(rid)
+
+    def append_req_hidden_states(
+        self,
+        rid: str,
+        aux_hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ):
+        num_new_tokens = aux_hidden_states.shape[0]
+        H = aux_hidden_states.shape[1]
+        H_last = hidden_states.shape[1]
+        dump_tokens = self.dump_tokens[rid]
+
+        aux_hs_buf = self.buffer_pool.get_buffer(
+            f"{rid}_hs",
+            aux_hidden_states.device,
+            aux_hidden_states.dtype,
+            dump_tokens * H + aux_hidden_states.numel(),
+        )
+        aux_hs_buf[dump_tokens * H : (dump_tokens + num_new_tokens) * H] = (
+            aux_hidden_states.view(-1)
+        )
+        hs_buf = self.buffer_pool.get_buffer(
+            f"{rid}_lhs",
+            hidden_states.device,
+            hidden_states.dtype,
+            dump_tokens * H_last + hidden_states.numel(),
+        )
+        hs_buf[dump_tokens * H_last : (dump_tokens + num_new_tokens) * H_last] = (
+            hidden_states.view(-1)
+        )
+        dump_tokens += num_new_tokens
+        self.hidden_state_buffer_map[rid] = HiddenStateForDump(
+            aux_hidden_states_for_dump=aux_hs_buf[: dump_tokens * H].view(dump_tokens, H),
+            hidden_states_for_dump=hs_buf[: dump_tokens * H_last].view(dump_tokens, H_last),
+        )
+        self.dump_tokens[rid] = dump_tokens
+        self.verify_cnt[rid] += 1
+
+    def dump_if_needed(self, req: CachedRequestState, rid: str):
+
+        self.dump_worker_idx = (self.dump_worker_idx + 1) % self.tp_size
+        if self.dump_worker_idx != self.tp_rank:
+            return
+
+        assert (
+            self.dump_path is not None
+        ), "speculative_eagle_hidden_states_dump_path must be set"
+
+        if self.accept_rate_threshold < 1.0:
+            acceptance_rate = (self.dump_tokens[rid] - req.num_prompt_tokens) / (
+                self.verify_cnt[rid] * self.num_speculative_tokens
+            )
+            # Skip dump if acceptance rate is higher than threshold
+            if acceptance_rate >= self.accept_rate_threshold:
+                return
+
+        dump_path = os.path.join(
+            self.dump_path,
+            f"{rid}_data.ckpt",
+        )
+
+        self.dump_executor.submit(
+            dump_hidden_states,
+            dump_path,
+            self.hidden_state_buffer_map[rid].hidden_states_for_dump,
+            self.hidden_state_buffer_map[rid].aux_hidden_states_for_dump,
+            req.prompt_token_ids,
+            req.output_token_ids,
+        )
+
+
+def dump_hidden_states(
+    dump_path: str,
+    last_hidden_states: torch.Tensor,
+    aux_hidden_states: torch.Tensor,
+    input_ids: List[int],
+    output_ids: List[int],
+):
+    input_ids = torch.tensor(input_ids + output_ids[:-1], dtype=torch.long).view(
+        -1
+    )
+    loss_mask = torch.zeros_like(input_ids)
+    loss_mask[len(input_ids) :] = 1
+    save_dict = {
+        "input_ids": input_ids,
+        "loss_mask": loss_mask,
+        "hidden_state": last_hidden_states,
+        "aux_hidden_state": aux_hidden_states,
+    }
+    torch.save(save_dict, dump_path)
+
+
+class FlatBufferPool:
+    def __init__(self, available_size: int = 64):
+        self.pool = dict()
+        self.available_buffers = deque(maxlen=available_size)
+
+    def get_buffer(
+        self,
+        key: str,
+        device: torch.device,
+        dtype: torch.dtype,
+        needed_elems: int,
+    ):
+        return self._ensure_buf(key, device, dtype, needed_elems)
+
+    def release_buffer(self, key: str):
+        if key in self.pool:
+            self.available_buffers.append(self.pool[key])
+            del self.pool[key]
+
+    def _ensure_buf(
+        self,
+        key: str,
+        device: torch.device,
+        dtype: torch.dtype,
+        needed_elems: int,
+        growth: float = 2.0,
+        min_elem: int = 2 * 1024 * 1024,
+    ):
+        """
+        Reusable expandable flat buffer (1D). Grows geometrically.
+        """
+
+        buf = self.pool[key] if key in self.pool else None
+        if buf is None:
+            buf = self.available_buffers.popleft() if self.available_buffers else None
+            if buf is not None:
+                self.pool[key] = buf
+
+        need_new = (
+            buf is None
+            or buf.device != device
+            or buf.dtype != dtype
+            or buf.numel() < needed_elems
+        )
+
+        if need_new:
+            # geometric growth to reduce realloc frequency
+            cap = max(needed_elems, min_elem)
+            if buf is not None and buf.numel() < needed_elems:
+                cap = max(int(buf.numel() * growth), cap)
+            new_buf = torch.empty(cap, device=device, dtype=dtype)
+            if buf is not None and buf.dtype == dtype and buf.device == device:
+                new_buf[: buf.numel()].copy_(buf)
+            self.pool[key] = new_buf
+            return new_buf
+
+        return buf
