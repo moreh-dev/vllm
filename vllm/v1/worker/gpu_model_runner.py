@@ -2876,7 +2876,7 @@ class GPUModelRunner(
         with record_function_or_nullcontext("gpu_model_runner: preprocess"):
             with self.synchronize_input_prep():
                 if self.speculative_config.dump_hidden_states:
-                    for rid in sorted(scheduler_output.finished_req_ids):
+                    for rid in scheduler_output.finished_req_ids:
                         self.hidden_state_dumper.dump_if_needed(self.requests[rid], rid)
                         self.hidden_state_dumper.release_request_buffer(rid)
                 # Update persistent batch states.

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
+import zlib
 from collections import defaultdict, deque
 from concurrent import futures
 from dataclasses import dataclass, field
@@ -402,7 +403,6 @@ class HiddenStateDumper:
         self.dump_executor = futures.ThreadPoolExecutor(
             max_workers=speculative_config.dump_worker_num,
         )
-        self.dump_worker_idx: int = -1
         self.payloads: HiddenStateDumpPayload = None
         self.dump_tokens = {}
         self.verify_cnt = {}
@@ -422,18 +422,21 @@ class HiddenStateDumper:
         num_scheduled_tokens = np.array(tokens, dtype=np.int32)
         for new_req in scheduler_output.scheduled_new_reqs:
             prefill_rids.add(new_req.req_id)
-        accept_length_per_req = []
-        sampled_token_ids = sampled_token_ids.cpu()
-        for i, rid in enumerate(rids):
-            if rid in prefill_rids:
-                accept_len = num_scheduled_tokens[i]
-            else:
-                accept_len = torch.sum(
-                    sampled_token_ids[i] != -1
-                ).item()  # -1 indicates invalid token
-            accept_length_per_req.append(accept_len)
+        with torch.cuda.stream(self.dump_stream):
+            aux_hidden_states = torch.cat(aux_hidden_states, dim=-1)
+            sampled_token_ids = sampled_token_ids.cpu()
 
-        aux_hidden_states = torch.cat(aux_hidden_states, dim=-1)
+        # Vectorized accept-length computation:
+        # - prefill requests use scheduled token count
+        # - decode requests count valid sampled tokens (non -1)
+        prefill_mask = np.fromiter((rid in prefill_rids for rid in rids),
+                                   dtype=bool,
+                                   count=len(rids))
+        sampled_counts = (sampled_token_ids != -1).sum(dim=1).cpu().numpy()
+        accept_length_per_req = np.where(
+            prefill_mask, num_scheduled_tokens, sampled_counts
+        ).tolist()
+
         self.payloads = HiddenStateDumpPayload(
             rids=rids,
             aux_hidden_states=aux_hidden_states,
@@ -457,12 +460,19 @@ class HiddenStateDumper:
 
         offset = 0
         for i, rid in enumerate(rids):
+            # Shard dumps across TP ranks deterministically to avoid duplicate work.
+            target_rank = zlib.crc32(rid.encode()) % self.tp_size
+            scheduled_len = num_scheduled_tokens[i]
+            if target_rank != self.tp_rank:
+                # Skip dump for this rid but keep offset aligned.
+                offset += scheduled_len
+                continue
+
             if rid not in self.dump_tokens:
                 self.dump_tokens[rid] = 0
                 self.verify_cnt[rid] = -1 # -1 for first prefill
-            scheduled_len = num_scheduled_tokens[i]
             accept_len = accept_length_per_req_cpu[i]
-            self.append_req_hidden_states(
+            self._append_req_hidden_states(
                 rid,
                 aux_hidden_states[offset : offset + accept_len],
                 last_hidden_states[offset : offset + accept_len],
@@ -472,13 +482,14 @@ class HiddenStateDumper:
         self.payloads = None
 
     def release_request_buffer(self, rid: str):
-        self.hidden_state_buffer_map.pop(rid)
-        self.buffer_pool.release_buffer(f"{rid}_hs")
-        self.buffer_pool.release_buffer(f"{rid}_lhs")
-        self.dump_tokens.pop(rid)
-        self.verify_cnt.pop(rid)
+        if rid in self.hidden_state_buffer_map:
+            self.hidden_state_buffer_map.pop(rid)
+            self.buffer_pool.release_buffer(f"{rid}_hs")
+            self.buffer_pool.release_buffer(f"{rid}_lhs")
+            self.dump_tokens.pop(rid)
+            self.verify_cnt.pop(rid)
 
-    def append_req_hidden_states(
+    def _append_req_hidden_states(
         self,
         rid: str,
         aux_hidden_states: torch.Tensor,
@@ -517,8 +528,7 @@ class HiddenStateDumper:
 
     def dump_if_needed(self, req: CachedRequestState, rid: str):
 
-        self.dump_worker_idx = (self.dump_worker_idx + 1) % self.tp_size
-        if self.dump_worker_idx != self.tp_rank:
+        if rid not in self.hidden_state_buffer_map:
             return
 
         assert (
