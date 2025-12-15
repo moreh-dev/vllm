@@ -281,6 +281,9 @@ class TPUWorker:
     def reload_weights(self) -> None:
         self.model_runner.reload_weights()
 
+    def reload_weights_from_path(self, model_path: str, is_draft: bool = False) -> None:
+        self.model_runner.reload_weights_from_path(model_path, is_draft=is_draft)
+
     def compile_or_warm_up_model(self) -> None:
         if not self.model_config.enforce_eager:
             self.model_runner.capture_model()

@@ -1925,6 +1925,11 @@ class UnloadLoRAAdapterRequest(BaseModel):
     lora_int_id: int | None = Field(default=None)
 
 
+class UpdateWeightsRequest(BaseModel):
+    model_path: str
+    is_draft: bool = False
+
+
 ## Protocols for Audio
 AudioResponseFormat: TypeAlias = Literal["json", "text", "srt", "verbose_json", "vtt"]
 

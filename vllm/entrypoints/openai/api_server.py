@@ -50,6 +50,7 @@ from vllm.entrypoints.openai.protocol import (
     ChatCompletionResponse,
     CompletionRequest,
     CompletionResponse,
+    UpdateWeightsRequest,
     ErrorInfo,
     ErrorResponse,
     ResponsesRequest,
@@ -310,6 +311,44 @@ async def show_available_models(raw_request: Request):
 async def show_version():
     ver = {"version": VLLM_VERSION}
     return JSONResponse(content=ver)
+
+
+@router.post(
+    "/v1/update_weights_from_disk",
+    dependencies=[Depends(validate_json_request)],
+)
+async def update_weights_from_disk(request: UpdateWeightsRequest, raw_request: Request):
+    engine = engine_client(raw_request)
+    await engine.pause_generation(
+        wait_for_inflight_requests=True, clear_cache=True
+    )
+    try:
+        results = await engine.collective_rpc(
+            method="reload_weights_from_path",
+            args=(request.model_path,),
+            kwargs={"is_draft": request.is_draft},
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)
+        ) from e
+    finally:
+        await engine.resume_generation()
+
+    safe_results: list[str | None] = []
+    if results is not None:
+        for item in results:
+            safe_results.append(None if item is None else str(item))
+
+    return JSONResponse(
+        content={
+            "status": "ok",
+            "model_path": request.model_path,
+            "is_draft": request.is_draft,
+            "worker_results": safe_results,
+        },
+        status_code=HTTPStatus.OK.value,
+    )
 
 
 async def _convert_stream_to_sse_events(

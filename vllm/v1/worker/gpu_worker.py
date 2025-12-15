@@ -278,6 +278,9 @@ class Worker(WorkerBase):
     def reload_weights(self) -> None:
         self.model_runner.reload_weights()
 
+    def reload_weights_from_path(self, model_path: str, is_draft: bool = False) -> None:
+        self.model_runner.reload_weights_from_path(model_path, is_draft=is_draft)
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much

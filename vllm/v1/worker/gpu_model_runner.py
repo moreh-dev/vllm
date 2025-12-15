@@ -3688,6 +3688,37 @@ class GPUModelRunner(
         logger.info("Reloading weights inplace...")
         model_loader.load_weights(self.get_model(), model_config=self.model_config)
 
+    def reload_weights_from_path(
+        self, model_path: str, is_draft: bool = False
+    ) -> None:
+        """
+        Reload weights for the target model (or draft model when requested)
+        from a different path, assuming architecture compatibility.
+        """
+        model_loader = get_model_loader(self.load_config)
+
+        if is_draft:
+            if self.speculative_config is None or not hasattr(self, "drafter"):
+                raise RuntimeError("Draft model is not configured on this worker.")
+            draft_model_config = self.speculative_config.draft_model_config
+            if draft_model_config is None:
+                raise RuntimeError("Draft model config missing; cannot reload draft.")
+            draft_model = getattr(self.drafter, "model", None)
+            if draft_model is None:
+                raise RuntimeError("Draft model is not loaded; cannot reload draft.")
+
+            draft_model_config.model = model_path
+            logger.info("Reloading draft model weights from %s ...", model_path)
+            model_loader.load_weights(draft_model, model_config=draft_model_config)
+            return
+
+        assert getattr(self, "model", None) is not None, (
+            "Cannot reload weights before model is loaded."
+        )
+        self.model_config.model = model_path
+        logger.info("Reloading target model weights from %s ...", model_path)
+        model_loader.load_weights(self.get_model(), model_config=self.model_config)
+
     def save_tensorized_model(
         self,
         tensorizer_config: "TensorizerConfig",
