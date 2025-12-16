@@ -569,13 +569,13 @@ def dump_hidden_states(
     input_ids: List[int],
     output_ids: List[int],
 ):
-    input_ids = torch.tensor(input_ids + output_ids[:-1], dtype=torch.long).view(
+    input_output_ids = torch.tensor(input_ids + output_ids[:-1], dtype=torch.long).view(
         -1
     )
-    loss_mask = torch.zeros_like(input_ids)
+    loss_mask = torch.zeros_like(input_output_ids)
     loss_mask[len(input_ids) :] = 1
     save_dict = {
-        "input_ids": input_ids,
+        "input_ids": input_output_ids,
         "loss_mask": loss_mask,
         "hidden_state": last_hidden_states,
         "aux_hidden_state": aux_hidden_states,
