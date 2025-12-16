@@ -557,6 +557,10 @@ class HiddenStateDumper:
             req.output_token_ids,
         )
 
+    def dump(self, req: CachedRequestState, rid: str):
+        self.dump_if_needed(req, rid)
+        self.release_request_buffer(rid)
+
 
 def dump_hidden_states(
     dump_path: str,

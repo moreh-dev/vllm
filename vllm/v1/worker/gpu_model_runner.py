@@ -2876,9 +2876,9 @@ class GPUModelRunner(
         with record_function_or_nullcontext("gpu_model_runner: preprocess"):
             with self.synchronize_input_prep():
                 if self.speculative_config.dump_hidden_states:
+                    finished_reqs = []
                     for rid in scheduler_output.finished_req_ids:
-                        self.hidden_state_dumper.dump_if_needed(self.requests[rid], rid)
-                        self.hidden_state_dumper.release_request_buffer(rid)
+                        finished_reqs.append(self.requests[rid])
                 # Update persistent batch states.
                 self._update_states(scheduler_output)
 
@@ -2891,6 +2891,10 @@ class GPUModelRunner(
                         return make_empty_encoder_model_runner_output(scheduler_output)
 
                 if not num_scheduled_tokens:
+                    if self.speculative_config.dump_hidden_states:
+                        self.hidden_state_dumper.process_dump_payload()
+                        for req in finished_reqs:
+                            self.hidden_state_dumper.dump(req, req.req_id)
                     if (
                         self.parallel_config.distributed_executor_backend
                         == "external_launcher"
@@ -3029,6 +3033,11 @@ class GPUModelRunner(
                 **model_kwargs,
             )
 
+        if self.speculative_config.dump_hidden_states:
+            self.hidden_state_dumper.process_dump_payload()
+            for req in finished_reqs:
+                self.hidden_state_dumper.dump(req, req.req_id)
+
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
@@ -3146,6 +3155,15 @@ class GPUModelRunner(
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
+        if self.speculative_config.dump_hidden_states:
+            self.hidden_state_dumper.prepare_payload(
+                self.input_batch.req_ids.copy(),
+                scheduler_output,
+                sampler_output.sampled_token_ids,
+                aux_hidden_states,
+                hidden_states,
+            )
+
         self.input_batch.prev_sampled_token_ids = None
 
         def propose_draft_token_ids(sampled_token_ids):
@@ -3223,16 +3241,6 @@ class GPUModelRunner(
                 scheduler_output.total_num_scheduled_tokens,
                 spec_decode_metadata,
             )
-
-        if self.speculative_config.dump_hidden_states:
-            self.hidden_state_dumper.prepare_payload(
-                req_ids_output_copy,
-                scheduler_output,
-                sampler_output.sampled_token_ids,
-                aux_hidden_states,
-                hidden_states,
-            )
-            self.hidden_state_dumper.process_dump_payload()
 
         if (
             self.speculative_config
