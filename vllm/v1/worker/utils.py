@@ -381,7 +381,8 @@ class HiddenStateDumpPayload:
     aux_hidden_states: torch.Tensor
     last_hidden_states: torch.Tensor
     num_scheduled_tokens: List[int]
-    accept_length_per_req_cpu: List[int]
+    prefill_rids: set[str]
+    sampled_token_ids: torch.Tensor
 
 @dataclass
 class HiddenStateForDump:
@@ -424,25 +425,14 @@ class HiddenStateDumper:
             prefill_rids.add(new_req.req_id)
         with torch.cuda.stream(self.dump_stream):
             aux_hidden_states = torch.cat(aux_hidden_states, dim=-1)
-            sampled_token_ids = sampled_token_ids.cpu()
-
-        # Vectorized accept-length computation:
-        # - prefill requests use scheduled token count
-        # - decode requests count valid sampled tokens (non -1)
-        prefill_mask = np.fromiter((rid in prefill_rids for rid in rids),
-                                   dtype=bool,
-                                   count=len(rids))
-        sampled_counts = (sampled_token_ids != -1).sum(dim=1).cpu().numpy()
-        accept_length_per_req = np.where(
-            prefill_mask, num_scheduled_tokens, sampled_counts
-        ).tolist()
 
         self.payloads = HiddenStateDumpPayload(
             rids=rids,
             aux_hidden_states=aux_hidden_states,
             last_hidden_states=last_hidden_states,
             num_scheduled_tokens=num_scheduled_tokens,
-            accept_length_per_req_cpu=accept_length_per_req,
+            prefill_rids=prefill_rids,
+            sampled_token_ids=sampled_token_ids,
         )
 
     def process_dump_payload(self):
@@ -453,10 +443,24 @@ class HiddenStateDumper:
         aux_hidden_states = self.payloads.aux_hidden_states
         last_hidden_states = self.payloads.last_hidden_states
         num_scheduled_tokens = self.payloads.num_scheduled_tokens
-        accept_length_per_req_cpu = self.payloads.accept_length_per_req_cpu
+        prefill_rids = self.payloads.prefill_rids
+        sampled_token_ids = self.payloads.sampled_token_ids
+
         with torch.cuda.stream(self.dump_stream):
+            sampled_token_ids = sampled_token_ids.cpu()
             aux_hidden_states = aux_hidden_states.cpu()
             last_hidden_states = last_hidden_states.cpu()
+
+        # Vectorized accept-length computation:
+        # - prefill requests use scheduled token count
+        # - decode requests count valid sampled tokens (non -1)
+        prefill_mask = np.fromiter((rid in prefill_rids for rid in rids),
+                                   dtype=bool,
+                                   count=len(rids))
+        sampled_counts = (sampled_token_ids != -1).sum(dim=1).numpy()
+        accept_length_per_req = np.where(
+            prefill_mask, num_scheduled_tokens, sampled_counts
+        ).tolist()
 
         offset = 0
         for i, rid in enumerate(rids):
@@ -471,7 +475,7 @@ class HiddenStateDumper:
             if rid not in self.dump_tokens:
                 self.dump_tokens[rid] = 0
                 self.verify_cnt[rid] = -1 # -1 for first prefill
-            accept_len = accept_length_per_req_cpu[i]
+            accept_len = accept_length_per_req[i]
             self._append_req_hidden_states(
                 rid,
                 aux_hidden_states[offset : offset + accept_len],
