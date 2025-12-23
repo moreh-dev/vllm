@@ -314,7 +314,7 @@ async def show_version():
 
 
 @router.post(
-    "/v1/update_weights_from_disk",
+    "/update_weights_from_disk",
     dependencies=[Depends(validate_json_request)],
 )
 async def update_weights_from_disk(request: UpdateWeightsRequest, raw_request: Request):
