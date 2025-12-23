@@ -1927,7 +1927,7 @@ class UnloadLoRAAdapterRequest(BaseModel):
 
 class UpdateWeightsRequest(BaseModel):
     model_path: str
-    is_draft: bool = False
+    is_draft_model: bool = False
 
 
 ## Protocols for Audio

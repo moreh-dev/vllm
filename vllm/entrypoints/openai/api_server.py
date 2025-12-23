@@ -326,7 +326,7 @@ async def update_weights_from_disk(request: UpdateWeightsRequest, raw_request: R
         results = await engine.collective_rpc(
             method="reload_weights_from_path",
             args=(request.model_path,),
-            kwargs={"is_draft": request.is_draft},
+            kwargs={"is_draft": request.is_draft_model},
         )
     except Exception as e:
         raise HTTPException(
@@ -344,7 +344,7 @@ async def update_weights_from_disk(request: UpdateWeightsRequest, raw_request: R
         content={
             "status": "ok",
             "model_path": request.model_path,
-            "is_draft": request.is_draft,
+            "is_draft_model": request.is_draft_model,
             "worker_results": safe_results,
         },
         status_code=HTTPStatus.OK.value,
