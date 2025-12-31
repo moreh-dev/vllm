@@ -190,6 +190,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # we need to fully match the relevant parts of
         # SamplingMetadata.selected_token_indices logic.
         self.sampler = get_sampler()
+        self.prefill_sequence_order: Optional[List[int]] = None
 
     def load_model(self) -> None:
         # Note: using custom TT loader
