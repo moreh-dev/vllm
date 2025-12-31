@@ -1031,6 +1031,107 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             else:
                 enc_dec_kwargs = {}
 
+            reorder_rows_for_current_sequences = None
+            if (not self.dp_kv_cache
+                    and self.prefill_sequence_order is not None
+                    and execute_model_kwargs["tokens"].shape[0] ==
+                    len(self.prefill_sequence_order)):
+                fixed_row_for_sequence_id = {
+                    sequence_id: row_index
+                    for row_index, sequence_id in enumerate(
+                        self.prefill_sequence_order)
+                }
+                missing_sequence_ids = [
+                    sequence_id for sequence_id in model_input.seq_groups
+                    if sequence_id not in fixed_row_for_sequence_id
+                ]
+                if not missing_sequence_ids:
+                    sequence_id_to_current_row = {
+                        sequence_id: row_index
+                        for row_index, sequence_id in enumerate(
+                            model_input.seq_groups)
+                    }
+                    reordered_tokens = torch.zeros_like(
+                        execute_model_kwargs["tokens"])
+                    reordered_positions = torch.zeros_like(
+                        execute_model_kwargs["start_pos"])
+                    reordered_page_table = torch.zeros_like(
+                        execute_model_kwargs["page_table"])
+
+                    for sequence_id, fixed_row_index in fixed_row_for_sequence_id.items(
+                    ):
+                        current_row_index = sequence_id_to_current_row.get(
+                            sequence_id)
+                        if current_row_index is None:
+                            continue
+                        reordered_tokens[fixed_row_index] = \
+                            execute_model_kwargs["tokens"][current_row_index]
+                        reordered_positions[fixed_row_index] = \
+                            execute_model_kwargs["start_pos"][current_row_index]
+                        reordered_page_table[fixed_row_index] = \
+                            execute_model_kwargs["page_table"][current_row_index]
+
+                    execute_model_kwargs["tokens"] = reordered_tokens
+                    execute_model_kwargs["start_pos"] = reordered_positions
+                    execute_model_kwargs["page_table"] = reordered_page_table
+
+                    if ("sampling_params" in execute_model_kwargs
+                            and execute_model_kwargs["sampling_params"]
+                            is not None):
+                        sampling_params = execute_model_kwargs[
+                            "sampling_params"]
+                        if isinstance(sampling_params.temperature, list):
+                            reordered_temperature = [
+                                PADDING_TEMPERATURE
+                            ] * len(self.prefill_sequence_order)
+                            reordered_top_k = [
+                                PADDING_TOP_K
+                            ] * len(self.prefill_sequence_order)
+                            reordered_top_p = [
+                                PADDING_TOP_P
+                            ] * len(self.prefill_sequence_order)
+                            for sequence_id, fixed_row_index in \
+                                    fixed_row_for_sequence_id.items():
+                                current_row_index = sequence_id_to_current_row.get(
+                                    sequence_id)
+                                if current_row_index is None:
+                                    continue
+                                reordered_temperature[
+                                    fixed_row_index] = sampling_params.temperature[
+                                        current_row_index]
+                                reordered_top_k[fixed_row_index] = \
+                                    sampling_params.top_k[current_row_index]
+                                reordered_top_p[fixed_row_index] = \
+                                    sampling_params.top_p[current_row_index]
+                            execute_model_kwargs[
+                                "sampling_params"] = TTSamplingParams(
+                                    temperature=reordered_temperature,
+                                    top_k=reordered_top_k,
+                                    top_p=reordered_top_p)
+
+                    reorder_rows_for_current_sequences = [
+                        fixed_row_for_sequence_id[sequence_id]
+                        for sequence_id in model_input.seq_groups
+                    ]
+
+            debug_decode = self._should_log_page_table("decode")
+            if debug_decode:
+                block_tables = execute_model_kwargs["page_table"]
+                active_slots = None
+                if self.dp_kv_cache:
+                    active_slots = [
+                        self.seq_groups_to_batch_slot[s]
+                        for s in model_input.seq_groups
+                    ]
+                logger.warning(
+                    "PAGE_TABLE_DEBUG decode-pre batch=%s block_table_shape=%s seq_groups_sample=%s active_slots_sample=%s",
+                    block_tables.shape[0],
+                    tuple(block_tables.shape),
+                    model_input.seq_groups[:DEBUG_PAGE_TABLE_ROWS],
+                    active_slots[:DEBUG_PAGE_TABLE_ROWS] if active_slots is not None else None,
+                )
+                self._log_page_table_rows("decode-pre", block_tables, model_input.seq_groups, active_slots)
+
             if self.dp_kv_cache:
                 # Calculate perm_table_tensor:
                 # perm_table_tensor[new_idx] = current_slot_idx
@@ -1116,7 +1217,18 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 tt_out = self.model.process_decode_output_host(
                     tt_out, is_tokens=model_input.perform_device_sampling)
                 if self.dp_kv_cache:
-                    tt_out = tt_out[perm_table_tensor]
+                    if isinstance(tt_out, tuple):
+                        reordered_primary = tt_out[0][perm_table_tensor]
+                        tt_out = (reordered_primary, ) + tt_out[1:]
+                    else:
+                        tt_out = tt_out[perm_table_tensor]
+                elif reorder_rows_for_current_sequences is not None:
+                    if isinstance(tt_out, tuple):
+                        reordered_primary = tt_out[0][
+                            reorder_rows_for_current_sequences]
+                        tt_out = (reordered_primary, ) + tt_out[1:]
+                    else:
+                        tt_out = tt_out[reorder_rows_for_current_sequences]
 
         def _unwrap_logits(output):
             if isinstance(output, tuple):
