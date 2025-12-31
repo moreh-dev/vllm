@@ -1115,23 +1115,6 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                         for sequence_id in model_input.seq_groups
                     ]
 
-            debug_decode = self._should_log_page_table("decode")
-            if debug_decode:
-                block_tables = execute_model_kwargs["page_table"]
-                active_slots = None
-                if self.dp_kv_cache:
-                    active_slots = [
-                        self.seq_groups_to_batch_slot[s]
-                        for s in model_input.seq_groups
-                    ]
-                logger.warning(
-                    "PAGE_TABLE_DEBUG decode-pre batch=%s block_table_shape=%s seq_groups_sample=%s active_slots_sample=%s",
-                    block_tables.shape[0],
-                    tuple(block_tables.shape),
-                    model_input.seq_groups[:DEBUG_PAGE_TABLE_ROWS],
-                    active_slots[:DEBUG_PAGE_TABLE_ROWS] if active_slots is not None else None,
-                )
-                self._log_page_table_rows("decode-pre", block_tables, model_input.seq_groups, active_slots)
 
             if self.dp_kv_cache:
                 # Calculate perm_table_tensor:
