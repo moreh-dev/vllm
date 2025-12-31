@@ -930,6 +930,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                           int), ("unpadded_batch_size must be an int")
 
         if not is_decode:
+            if not self.dp_kv_cache:
+                self.prefill_sequence_order = list(model_input.seq_groups)
+
             if self.dp_kv_cache:
                 slots_to_allocate = self.empty_slots[:model_input.
                                                      unpadded_batch_size]
@@ -985,6 +988,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         else:  #decode
             if self.model_config.is_encoder_decoder:
                 assert self.cached_req_data
+
 
                 # Use encoder-decoder data from prefill step
                 prefill_cross_attention_masks = [
