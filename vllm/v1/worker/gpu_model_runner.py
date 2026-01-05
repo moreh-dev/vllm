@@ -2875,7 +2875,7 @@ class GPUModelRunner(
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with record_function_or_nullcontext("gpu_model_runner: preprocess"):
             with self.synchronize_input_prep():
-                if self.speculative_config.dump_hidden_states:
+                if self.speculative_config is not None and self.speculative_config.dump_hidden_states:
                     finished_reqs = []
                     for rid in scheduler_output.finished_req_ids:
                         finished_reqs.append(self.requests[rid])
@@ -2891,7 +2891,7 @@ class GPUModelRunner(
                         return make_empty_encoder_model_runner_output(scheduler_output)
 
                 if not num_scheduled_tokens:
-                    if self.speculative_config.dump_hidden_states:
+                    if self.speculative_config is not None and self.speculative_config.dump_hidden_states:
                         self.hidden_state_dumper.process_dump_payload()
                         for req in finished_reqs:
                             self.hidden_state_dumper.dump(req, req.req_id)
@@ -3033,7 +3033,7 @@ class GPUModelRunner(
                 **model_kwargs,
             )
 
-        if self.speculative_config.dump_hidden_states:
+        if self.speculative_config is not None and self.speculative_config.dump_hidden_states:
             self.hidden_state_dumper.process_dump_payload()
             for req in finished_reqs:
                 self.hidden_state_dumper.dump(req, req.req_id)
@@ -3155,7 +3155,7 @@ class GPUModelRunner(
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
-        if self.speculative_config.dump_hidden_states:
+        if self.speculative_config is not None and self.speculative_config.dump_hidden_states:
             self.hidden_state_dumper.prepare_payload(
                 self.input_batch.req_ids.copy(),
                 scheduler_output,
