@@ -600,7 +600,7 @@ class GPUModelRunner(
         self.kv_connector_output: KVConnectorOutput | None = None
 
         # hidden state dumper
-        if self.speculative_config.dump_hidden_states:
+        if self.speculative_config is not None and self.speculative_config.dump_hidden_states:
             self.hidden_state_dumper = HiddenStateDumper(self.speculative_config)
 
     def reset_mm_cache(self) -> None:
