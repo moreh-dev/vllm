@@ -23,9 +23,11 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 from vllm.model_executor.layers.fused_moe.utils import _resize_cache
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
+    per_token_group_quant_fp8_packed_for_deepgemm,
     silu_mul_per_token_group_quant_fp8_colmajor,
 )
 from vllm.utils.deep_gemm import (
+    DeepGemmQuantScaleFMT,
     get_mk_alignment_for_contiguous_layout,
     m_grouped_fp8_gemm_nt_contiguous,
 )
@@ -141,6 +143,7 @@ class DeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
         global_num_experts: int,
         local_num_experts: int,
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        activation: str,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
         assert self.block_shape is not None
         block_m = self.block_shape[0]
@@ -149,7 +152,8 @@ class DeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
         )
         assert M_sum % block_m == 0
 
-        workspace1 = (M_sum, max(N // 2, K))
+        activation_out_dim = self.adjust_N_for_activation(N, activation)
+        workspace1 = (M_sum, max(activation_out_dim, K))
         workspace2 = (M_sum, max(N, K))
         output = (M, K)
         return (workspace1, workspace2, output)
@@ -157,23 +161,43 @@ class DeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
     def _act_mul_quant(
         self, input: torch.Tensor, output: torch.Tensor, activation: str
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if activation == "silu":
-            return silu_mul_per_token_group_quant_fp8_colmajor(
-                input=input, output=output
-            )
-        else:
-            # This is a fallback path. If we find ourselves using any activation other
-            # than silu, we should add that activation to
-            # silu_mul_per_token_group_quant_fp8_colmajor kernel as it is much faster.
-            M_sum, N = input.size()
+        assert self.block_shape is not None
+        block_k = self.block_shape[1]
+        scale_fmt = DeepGemmQuantScaleFMT.from_oracle()
+
+        M_sum, N = input.size()
+        activation_out_dim = self.adjust_N_for_activation(N, activation)
+
+        # 1. DeepGemm UE8M0: use packed per-token-group quant
+        if scale_fmt == DeepGemmQuantScaleFMT.UE8M0:
             act_out = torch.empty(
-                (M_sum, N // 2), dtype=input.dtype, device=input.device
+                (M_sum, activation_out_dim), dtype=input.dtype, device=input.device
             )
             self.activation(activation, act_out, input)
-            assert self.block_shape is not None
-            return per_token_group_quant_fp8(
-                act_out, self.block_shape[1], column_major_scales=True, out_q=output
+            a2q, a2q_scale = per_token_group_quant_fp8_packed_for_deepgemm(
+                act_out,
+                block_k,
+                out_q=output,
             )
+            return a2q, a2q_scale
+
+        # 2. Hopper / non‑E8M0: prefer the fused SiLU+mul+quant kernel
+        if activation == "silu":
+            use_ue8m0 = scale_fmt == DeepGemmQuantScaleFMT.FLOAT32_CEIL_UE8M0
+            return silu_mul_per_token_group_quant_fp8_colmajor(
+                input=input,
+                output=output,
+                use_ue8m0=use_ue8m0,
+            )
+
+        # 3. fallback path for non-SiLU activations in non‑UE8M0 cases.
+        act_out = torch.empty(
+            (M_sum, activation_out_dim), dtype=input.dtype, device=input.device
+        )
+        self.activation(activation, act_out, input)
+        return per_token_group_quant_fp8(
+            act_out, block_k, column_major_scales=True, out_q=output
+        )
 
     def apply(
         self,
@@ -235,8 +259,9 @@ class DeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
             (a1q, a1q_scale), (w1, self.w1_scale), mm1_out, expert_ids
         )
 
+        activation_out_dim = self.adjust_N_for_activation(N, activation)
         quant_out = _resize_cache(
-            workspace13.view(dtype=torch.float8_e4m3fn), (M_sum, N // 2)
+            workspace13.view(dtype=torch.float8_e4m3fn), (M_sum, activation_out_dim)
         )
         a2q, a2q_scale = self._act_mul_quant(
             input=mm1_out.view(-1, N), output=quant_out, activation=activation
@@ -274,7 +299,7 @@ def deep_gemm_moe_fp8(
     expert_map: torch.Tensor | None = None,
     a1_scale: torch.Tensor | None = None,
     a2_scale: torch.Tensor | None = None,
-    apply_router_weight_on_input=False,
+    apply_router_weight_on_input: bool = False,
 ) -> torch.Tensor:
     """
     This function computes a a8w8-quantized Mixture of Experts (MoE) layer

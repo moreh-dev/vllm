@@ -24,11 +24,12 @@ class MLAModules:
     q_b_proj: torch.nn.Module | None
     q_proj: torch.nn.Module | None
     indexer: torch.nn.Module | None
-    indexer_rotary_emb: torch.nn.Module | None
     is_sparse: bool
     topk_indices_buffer: torch.Tensor | None
+    indexer_rotary_emb: torch.nn.Module | None = None
 
 
+# --8<-- [start:multi_head_latent_attention]
 @CustomOp.register("multi_head_latent_attention")
 class MultiHeadLatentAttentionWrapper(CustomOp):
     """MLA layer registered as CustomOp to allow OOT backends to add
@@ -46,6 +47,8 @@ class MultiHeadLatentAttentionWrapper(CustomOp):
        multi-query attention to decode tokens separately.
     3. Return the output tensor.
     """
+
+    # --8<-- [end:multi_head_latent_attention]
 
     def __init__(
         self,
