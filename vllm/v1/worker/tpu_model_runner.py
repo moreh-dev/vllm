@@ -1421,7 +1421,11 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             draft_model_config.model = model_path
             logger.info("Reloading draft model weights from %s ...", model_path)
-            model_loader.load_weights(draft_model, model_config=draft_model_config)
+            drafter_reload = getattr(self.drafter, "reload_weights_from_path", None)
+            if callable(drafter_reload):
+                drafter_reload(model_path, model_loader)
+            else:
+                model_loader.load_weights(draft_model, model_config=draft_model_config)
             return
 
         assert getattr(self, "model", None) is not None, (

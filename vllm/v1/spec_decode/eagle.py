@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import ast
+import copy
 from dataclasses import replace
 from importlib.util import find_spec
 
@@ -97,6 +98,8 @@ class EagleProposer:
         )
 
         self.use_cuda_graph = False
+        self._draft_lm_head = None
+        self._shared_lm_head = False
 
         self.compilation_config = self.vllm_config.compilation_config
         if self.compilation_config.mode == CompilationMode.VLLM_COMPILE:
@@ -1027,6 +1030,7 @@ class EagleProposer:
             target_language_model = target_model.get_language_model()
         else:
             target_language_model = target_model
+        self._target_language_model = target_language_model
 
         # share embed_tokens with the target model if needed
         if get_pp_group().world_size == 1:
@@ -1128,9 +1132,85 @@ class EagleProposer:
             )
 
         if share_lm_head and hasattr(target_language_model, "lm_head"):
+            if hasattr(self.model, "lm_head") and self._draft_lm_head is None:
+                self._draft_lm_head = self.model.lm_head
             if hasattr(self.model, "lm_head"):
                 del self.model.lm_head
             self.model.lm_head = target_language_model.lm_head
+            self._shared_lm_head = True
+        else:
+            self._shared_lm_head = False
+
+    def reload_weights_from_path(
+        self,
+        model_path: str,
+        model_loader,
+    ) -> None:
+        def _lm_head_weight_ptr(model: nn.Module) -> int | None:
+            if not hasattr(model, "lm_head"):
+                return None
+            lm_head = getattr(model, "lm_head")
+            weight = getattr(lm_head, "weight", None)
+            if isinstance(weight, torch.Tensor):
+                return weight.data_ptr()
+            return None
+
+        target_language_model = getattr(self, "_target_language_model", None)
+        pre_load_ptr = _lm_head_weight_ptr(self.model)
+        if self._shared_lm_head:
+            if self._draft_lm_head is None:
+                if target_language_model is None or not hasattr(
+                    target_language_model, "lm_head"
+                ):
+                    logger.warning(
+                        "Draft lm_head was shared but no cached draft lm_head is "
+                        "available; keeping the shared lm_head for reload."
+                    )
+                else:
+                    self._draft_lm_head = copy.deepcopy(
+                        target_language_model.lm_head
+                    )
+            if self._draft_lm_head is not None:
+                self.model.lm_head = self._draft_lm_head
+                self._shared_lm_head = False
+                logger.info(
+                    "Reloading draft weights: restored draft lm_head before load."
+                )
+
+        if hasattr(self.model, "has_own_lm_head"):
+            self.model.has_own_lm_head = False
+
+        self.draft_model_config.model = model_path
+        model_loader.load_weights(self.model, model_config=self.draft_model_config)
+        post_load_ptr = _lm_head_weight_ptr(self.model)
+
+        if hasattr(self.model, "has_own_lm_head"):
+            if self.model.has_own_lm_head:
+                self._shared_lm_head = False
+                logger.info(
+                    "Reloaded draft weights: keeping separate lm_head from target."
+                )
+                logger.info(
+                    "Reloaded draft weights: lm_head loaded from checkpoint "
+                    "(weight ptr %s -> %s).",
+                    pre_load_ptr,
+                    post_load_ptr,
+                )
+            elif target_language_model is not None and hasattr(
+                target_language_model, "lm_head"
+            ):
+                self.model.lm_head = target_language_model.lm_head
+                self._shared_lm_head = True
+                self._draft_lm_head = None
+                logger.info(
+                    "Reloaded draft weights: sharing target lm_head again."
+                )
+                logger.info(
+                    "Reloaded draft weights: lm_head not in checkpoint; "
+                    "sharing target (weight ptr %s -> %s).",
+                    pre_load_ptr,
+                    post_load_ptr,
+                )
 
     @torch.inference_mode()
     def dummy_run(

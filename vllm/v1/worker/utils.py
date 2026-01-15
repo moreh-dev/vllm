@@ -423,8 +423,8 @@ class HiddenStateDumper:
         num_scheduled_tokens = np.array(tokens, dtype=np.int32)
         for new_req in scheduler_output.scheduled_new_reqs:
             prefill_rids.add(new_req.req_id)
-        with torch.cuda.stream(self.dump_stream):
-            aux_hidden_states = torch.cat(aux_hidden_states, dim=-1)
+        aux_hidden_states = torch.cat(aux_hidden_states, dim=-1)
+        last_hidden_states = last_hidden_states.detach().clone()
 
         self.payloads = HiddenStateDumpPayload(
             rids=rids,
@@ -446,10 +446,9 @@ class HiddenStateDumper:
         prefill_rids = self.payloads.prefill_rids
         sampled_token_ids = self.payloads.sampled_token_ids
 
-        with torch.cuda.stream(self.dump_stream):
-            sampled_token_ids = sampled_token_ids.cpu()
-            aux_hidden_states = aux_hidden_states.cpu()
-            last_hidden_states = last_hidden_states.cpu()
+        sampled_token_ids = sampled_token_ids.cpu()
+        aux_hidden_states = aux_hidden_states.cpu()
+        last_hidden_states = last_hidden_states.cpu()
 
         # Vectorized accept-length computation:
         # - prefill requests use scheduled token count
