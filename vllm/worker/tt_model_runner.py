@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import math
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Set, Type, Union
 
@@ -179,8 +180,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             self.cached_req_data: Dict[int, Dict[str, Any]] = {}
             self.previous_seq_ids: Set[int] = set()
 
-        vocab_size = self.model_config.get_vocab_size()
-        self.logits_processor = LogitsProcessor(vocab_size,
+        self.vocab_size = self.model_config.get_vocab_size()
+        self.logits_processor = LogitsProcessor(self.vocab_size,
                                                 logits_as_input=True)
         # We are relying on having our logits shaped correctly,
         # as if they came from a regular vLLM model
@@ -189,6 +190,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         # we need to fully match the relevant parts of
         # SamplingMetadata.selected_token_indices logic.
         self.sampler = get_sampler()
+        self.prefill_sequence_order: Optional[List[int]] = None
 
     def load_model(self) -> None:
         # Note: using custom TT loader
@@ -832,6 +834,51 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 CompletionSequenceGroupOutput(seq_outputs, None))
         return SamplerOutput(sampler_outputs)
 
+    def _extract_last_token_logits(self, logits_tensor: torch.Tensor,
+                                   unpadded_batch_size: int) -> torch.Tensor:
+        vocab_size = self.vocab_size
+
+        if logits_tensor.ndim == 3:
+            return logits_tensor[:unpadded_batch_size, -1, :]
+
+        if logits_tensor.ndim == 2:
+            last_dim = logits_tensor.shape[-1]
+            if last_dim == vocab_size:
+                return logits_tensor[:unpadded_batch_size, :]
+            if last_dim % vocab_size == 0:
+                seq_len = last_dim // vocab_size
+                reshaped = logits_tensor.view(logits_tensor.shape[0], seq_len, vocab_size)
+                return reshaped[:unpadded_batch_size, -1, :]
+            return logits_tensor[:unpadded_batch_size, :]
+
+        if logits_tensor.ndim == 1:
+            reshaped = self._reshape_flat_logits(logits_tensor, unpadded_batch_size)
+            return reshaped[:unpadded_batch_size, -1, :]
+
+        raise ValueError(f"{tuple(logits_tensor.shape)=}")
+
+    def _reshape_flat_logits(self, logits_tensor: torch.Tensor,
+                             unpadded_batch_size: int) -> torch.Tensor:
+        vocab_size = self.vocab_size
+        total = logits_tensor.numel()
+        remainder = total % vocab_size
+        if remainder != 0:
+            pad = vocab_size - remainder
+            logits_tensor = F.pad(logits_tensor, (0, pad))
+            total += pad
+
+        seq_prod = total // vocab_size
+        if seq_prod == 0:
+            return logits_tensor.view(0, 1, vocab_size)
+
+        reshaped = logits_tensor.view(seq_prod, 1, vocab_size)
+
+        if seq_prod < unpadded_batch_size:
+            repeat_factor = math.ceil(unpadded_batch_size / seq_prod)
+            reshaped = reshaped.repeat(repeat_factor, 1, 1)
+
+        return reshaped
+
     def _send_prev_step_async_out(self, model_input: TTModelInput, step_idx):
         if step_idx > 0:
             step_output = self.cached_step_outputs.pop(0)
@@ -883,6 +930,9 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                           int), ("unpadded_batch_size must be an int")
 
         if not is_decode:
+            if not self.dp_kv_cache:
+                self.prefill_sequence_order = list(model_input.seq_groups)
+
             if self.dp_kv_cache:
                 slots_to_allocate = self.empty_slots[:model_input.
                                                      unpadded_batch_size]
@@ -939,6 +989,7 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             if self.model_config.is_encoder_decoder:
                 assert self.cached_req_data
 
+
                 # Use encoder-decoder data from prefill step
                 prefill_cross_attention_masks = [
                     self.cached_req_data[seq_id]
@@ -984,6 +1035,90 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 self.previous_seq_ids = set(model_input.seq_groups)
             else:
                 enc_dec_kwargs = {}
+
+            reorder_rows_for_current_sequences = None
+            if (not self.dp_kv_cache
+                    and self.prefill_sequence_order is not None
+                    and execute_model_kwargs["tokens"].shape[0] ==
+                    len(self.prefill_sequence_order)):
+                fixed_row_for_sequence_id = {
+                    sequence_id: row_index
+                    for row_index, sequence_id in enumerate(
+                        self.prefill_sequence_order)
+                }
+                missing_sequence_ids = [
+                    sequence_id for sequence_id in model_input.seq_groups
+                    if sequence_id not in fixed_row_for_sequence_id
+                ]
+                if not missing_sequence_ids:
+                    sequence_id_to_current_row = {
+                        sequence_id: row_index
+                        for row_index, sequence_id in enumerate(
+                            model_input.seq_groups)
+                    }
+                    reordered_tokens = torch.zeros_like(
+                        execute_model_kwargs["tokens"])
+                    reordered_positions = torch.zeros_like(
+                        execute_model_kwargs["start_pos"])
+                    reordered_page_table = torch.zeros_like(
+                        execute_model_kwargs["page_table"])
+
+                    for sequence_id, fixed_row_index in fixed_row_for_sequence_id.items(
+                    ):
+                        current_row_index = sequence_id_to_current_row.get(
+                            sequence_id)
+                        if current_row_index is None:
+                            continue
+                        reordered_tokens[fixed_row_index] = \
+                            execute_model_kwargs["tokens"][current_row_index]
+                        reordered_positions[fixed_row_index] = \
+                            execute_model_kwargs["start_pos"][current_row_index]
+                        reordered_page_table[fixed_row_index] = \
+                            execute_model_kwargs["page_table"][current_row_index]
+
+                    execute_model_kwargs["tokens"] = reordered_tokens
+                    execute_model_kwargs["start_pos"] = reordered_positions
+                    execute_model_kwargs["page_table"] = reordered_page_table
+
+                    if ("sampling_params" in execute_model_kwargs
+                            and execute_model_kwargs["sampling_params"]
+                            is not None):
+                        sampling_params = execute_model_kwargs[
+                            "sampling_params"]
+                        if isinstance(sampling_params.temperature, list):
+                            reordered_temperature = [
+                                PADDING_TEMPERATURE
+                            ] * len(self.prefill_sequence_order)
+                            reordered_top_k = [
+                                PADDING_TOP_K
+                            ] * len(self.prefill_sequence_order)
+                            reordered_top_p = [
+                                PADDING_TOP_P
+                            ] * len(self.prefill_sequence_order)
+                            for sequence_id, fixed_row_index in \
+                                    fixed_row_for_sequence_id.items():
+                                current_row_index = sequence_id_to_current_row.get(
+                                    sequence_id)
+                                if current_row_index is None:
+                                    continue
+                                reordered_temperature[
+                                    fixed_row_index] = sampling_params.temperature[
+                                        current_row_index]
+                                reordered_top_k[fixed_row_index] = \
+                                    sampling_params.top_k[current_row_index]
+                                reordered_top_p[fixed_row_index] = \
+                                    sampling_params.top_p[current_row_index]
+                            execute_model_kwargs[
+                                "sampling_params"] = TTSamplingParams(
+                                    temperature=reordered_temperature,
+                                    top_k=reordered_top_k,
+                                    top_p=reordered_top_p)
+
+                    reorder_rows_for_current_sequences = [
+                        fixed_row_for_sequence_id[sequence_id]
+                        for sequence_id in model_input.seq_groups
+                    ]
+
 
             if self.dp_kv_cache:
                 # Calculate perm_table_tensor:
@@ -1070,12 +1205,28 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 tt_out = self.model.process_decode_output_host(
                     tt_out, is_tokens=model_input.perform_device_sampling)
                 if self.dp_kv_cache:
-                    tt_out = tt_out[perm_table_tensor]
+                    if isinstance(tt_out, tuple):
+                        reordered_primary = tt_out[0][perm_table_tensor]
+                        tt_out = (reordered_primary, ) + tt_out[1:]
+                    else:
+                        tt_out = tt_out[perm_table_tensor]
+                elif reorder_rows_for_current_sequences is not None:
+                    if isinstance(tt_out, tuple):
+                        reordered_primary = tt_out[0][
+                            reorder_rows_for_current_sequences]
+                        tt_out = (reordered_primary, ) + tt_out[1:]
+                    else:
+                        tt_out = tt_out[reorder_rows_for_current_sequences]
+
+        def _unwrap_logits(output):
+            if isinstance(output, tuple):
+                return output[0]
+            return output
 
         if model_input.compat_sampling_used:
             # compat sampling is only supported on host
-            tt_logits = tt_out[:model_input.unpadded_batch_size,
-                               -1, :]  # [unpadded batch, vocab]
+            tt_logits = self._extract_last_token_logits(
+                _unwrap_logits(tt_out), model_input.unpadded_batch_size)
             #This is coincidentally the same shape as the logits
             # we would get from a regular vllm model,
             # assuming we have no prompt logprobs, and one sequence per group.
@@ -1095,7 +1246,8 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         else:
             if not model_input.perform_device_sampling:
                 # unpadded batch, vocab of last token
-                next_logits = tt_out[:model_input.unpadded_batch_size, -1, :]
+                next_logits = self._extract_last_token_logits(
+                    _unwrap_logits(tt_out), model_input.unpadded_batch_size)
                 assert model_input.tt_sampling_params is not None
                 assert isinstance(
                     model_input.tt_sampling_params, TTSamplingParams), (

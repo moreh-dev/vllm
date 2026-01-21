@@ -190,6 +190,10 @@ class TTPlatform(Platform):
             if not arch_names[i].startswith("TT"):
                 arch_names[i] = "TT" + arch_names[i]
 
+        cache_config = vllm_config.cache_config
+        if cache_config and cache_config.block_size is None:
+            cache_config.block_size = 128
+
         # Setting attributes on the class level is kind of hacky, but
         # it's the only way to make validate_request depend on vllm_config
         # This is needed to catch incompatible requests early enough

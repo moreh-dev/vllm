@@ -1,6 +1,6 @@
 #!/bin/bash
 
-source /home/jungwook/tt-metal_moreh/python_env/bin/activate
+#source /home/jungwook/tt-metal_moreh/python_env/bin/activate
 
 export VLLM_TARGET_DEVICE="tt"
 

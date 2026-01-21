@@ -84,7 +84,7 @@ def create_mesh_device(device_params: Optional[Dict] = None):
 
     updated_device_params = get_updated_device_params(params)
     device_ids = ttnn.get_device_ids()
-
+    
     env_mesh_shape = parse_mesh_shape_from_env()
     if env_mesh_shape:
         default_mesh_shape = env_mesh_shape
