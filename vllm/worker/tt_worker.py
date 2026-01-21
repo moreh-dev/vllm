@@ -504,9 +504,8 @@ def get_fabric_config(override_tt_config, num_devices):
             "FABRIC_1D": ttnn.FabricConfig.FABRIC_1D,
             "FABRIC_1D_RING": ttnn.FabricConfig.FABRIC_1D_RING,
             "FABRIC_2D": ttnn.FabricConfig.FABRIC_2D,
+            "FABRIC_2D_TORUS_XY": ttnn.FabricConfig.FABRIC_2D_TORUS_XY,
             "CUSTOM": ttnn.FabricConfig.CUSTOM,
-            "FABRIC_2D_DYNAMIC": ttnn.FabricConfig.FABRIC_2D_DYNAMIC,
-            "FABRIC_2D_DYNAMIC_TORUS_XY": ttnn.FabricConfig.FABRIC_2D_DYNAMIC_TORUS_XY,
         }
         fabric_config = fabric_config_map.get(fabric_config_str)
         assert fabric_config is not None, (
