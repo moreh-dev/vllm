@@ -1,10 +1,6 @@
 FROM vllm/vllm-openai:v0.13.0
-# nvidia/cuda:12.4.1-devel-ubuntu22.04
 
-
-# python3, pip, python-is-python3, git 설치
 RUN apt-get update && apt-get install -y git
-#  apt-get install -y python3 python3-pip python-is-python3 git && rm -rf /var/lib/apt/lists/*
 RUN pip uninstall -y vllm
 RUN pip install wandb
 
