@@ -15,8 +15,9 @@ RUN pip install wandb
 RUN git clone https://github.com/moreh-dev/vllm.git /root/vllm
 WORKDIR /root/vllm
 RUN git checkout dump-hidden-states
-RUN if [ "${TARGET,,}" = "mi250" ]; then \
-      export PYTORCH_ROCM_ARCH="gfx90a;gfx942" && python3 setup.py develop; \
+RUN target_lower=$(printf '%s' \"$TARGET\" | tr '[:upper:]' '[:lower:]') && \
+    if [ \"$target_lower\" = \"mi250\" ]; then \
+      export PYTORCH_ROCM_ARCH=\"gfx90a\" && python3 setup.py develop; \
     else \
       VLLM_PRECOMPILED_WHEEL_COMMIT=4fd9d6a85c00ac0186aa9abbeff73fc2ac6c721e VLLM_USE_PRECOMPILED=1 pip install --editable .; \
     fi
