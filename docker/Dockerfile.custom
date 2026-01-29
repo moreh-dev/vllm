@@ -1,8 +1,10 @@
-ARG TARGET=DEFAULT
+ARG TARGET=default
 
-FROM vllm/vllm-openai:v0.13.0 AS base_DEFAULT
-FROM rocm/vllm:v0.14.0_amd_dev AS base_MI250
+FROM vllm/vllm-openai:v0.13.0 AS base_default
+FROM rocm/vllm:v0.14.0_amd_dev AS base_mi250
 
+# Select the proper base image; TARGET must be lowercase to satisfy Docker's
+# repository/name rules (e.g., TARGET=mi250).
 FROM base_${TARGET} AS base
 ARG TARGET
 
@@ -13,7 +15,7 @@ RUN pip install wandb
 RUN git clone https://github.com/moreh-dev/vllm.git /root/vllm
 WORKDIR /root/vllm
 RUN git checkout dump-hidden-states
-RUN if [ "${TARGET}" = "MI250" ]; then \
+RUN if [ "${TARGET,,}" = "mi250" ]; then \
       export PYTORCH_ROCM_ARCH="gfx90a;gfx942" && python3 setup.py develop; \
     else \
       VLLM_PRECOMPILED_WHEEL_COMMIT=4fd9d6a85c00ac0186aa9abbeff73fc2ac6c721e VLLM_USE_PRECOMPILED=1 pip install --editable .; \
