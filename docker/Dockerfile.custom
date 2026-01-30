@@ -7,6 +7,8 @@ FROM rocm/vllm:v0.14.0_amd_dev AS base_mi250
 # repository/name rules (e.g., TARGET=mi250).
 FROM base_${TARGET} AS base
 ARG TARGET
+# Log chosen base to make sure the build arg was applied.
+RUN echo "[build] selected base stage: base_${TARGET}"
 
 RUN apt-get update && apt-get install -y git
 RUN pip uninstall -y vllm
@@ -15,11 +17,20 @@ RUN pip install wandb
 RUN git clone https://github.com/moreh-dev/vllm.git /root/vllm
 WORKDIR /root/vllm
 RUN git checkout dump-hidden-states
-RUN target_lower=$(printf '%s' \"$TARGET\" | tr '[:upper:]' '[:lower:]') && \
-    if [ \"$target_lower\" = \"mi250\" ]; then \
-      export PYTORCH_ROCM_ARCH=\"gfx90a\" && python3 setup.py develop; \
-    else \
-      VLLM_PRECOMPILED_WHEEL_COMMIT=4fd9d6a85c00ac0186aa9abbeff73fc2ac6c721e VLLM_USE_PRECOMPILED=1 pip install --editable .; \
-    fi
+RUN echo "[build] TARGET=$TARGET" && \
+    case "$TARGET" in \
+      mi250|MI250) \
+        echo "[build] MI250 path: PYTORCH_ROCM_ARCH=gfx90a"; \
+        export PYTORCH_ROCM_ARCH="gfx90a" && python3 setup.py develop; \
+        ;; \
+      default|DEFAULT|"") \
+        echo "[build] DEFAULT path: precompiled wheel"; \
+        VLLM_PRECOMPILED_WHEEL_COMMIT=4fd9d6a85c00ac0186aa9abbeff73fc2ac6c721e VLLM_USE_PRECOMPILED=1 pip install --editable .; \
+        ;; \
+      *) \
+        echo "[build] ERROR: unsupported TARGET '$TARGET' (expected mi250 or default)" >&2; \
+        exit 1; \
+        ;; \
+    esac
 
 ENTRYPOINT ["/bin/bash"]
