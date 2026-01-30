@@ -101,7 +101,12 @@ async def render_chat_completion(request: ChatCompletionRequest, raw_request: Re
     if isinstance(result, ErrorResponse):
         return JSONResponse(content=result.model_dump(), status_code=result.error.code)
 
-    return JSONResponse(content=result)
+    conversation, engine_prompts = result
+    # Serialize Pydantic models (Harmony) or pass through TypedDicts as-is
+    serialized_conversation = [
+        getattr(msg, "model_dump", lambda m=msg: m)() for msg in conversation
+    ]
+    return JSONResponse(content=[serialized_conversation, engine_prompts])
 
 
 def attach_router(app: FastAPI):

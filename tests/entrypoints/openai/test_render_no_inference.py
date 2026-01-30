@@ -13,7 +13,7 @@ import pytest_asyncio
 
 from ...utils import RemoteOpenAIServer
 
-MODEL_NAME = "hmellor/tiny-random-LlamaForCausalLM"
+MODEL_NAME = "openai/gpt-oss-20b"
 
 
 @pytest.fixture(scope="module")
@@ -60,9 +60,25 @@ async def test_chat_completion_render_works_without_inference(client):
 
     conversation, engine_prompts = data
 
-    # Verify conversation is preserved
-    assert conversation[0]["role"] == "user"
-    assert "Hello" in conversation[0]["content"]
+    # Verify conversation contains messages
+    assert len(conversation) > 0
+
+    # Find the user message (Harmony models use 'author' dict instead of 'role')
+    user_msg = None
+    for msg in conversation:
+        # Check for direct 'role' key (standard format)
+        if msg.get("role") == "user":
+            user_msg = msg
+            break
+        # Check for nested 'author' dict (Harmony format)
+        author = msg.get("author")
+        if isinstance(author, dict) and author.get("role") == "user":
+            user_msg = msg
+            break
+
+    assert user_msg is not None, (
+        f"User message not found in conversation: {conversation}"
+    )
 
     # Verify tokenization occurred
     assert len(engine_prompts) > 0
