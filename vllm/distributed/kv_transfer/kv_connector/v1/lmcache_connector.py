@@ -16,6 +16,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
 )
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
@@ -69,7 +70,7 @@ class LMCacheKVEvents(KVConnectorKVEvents):
         return f"<LMCacheKVEvents events={self.get_all_events()}>"
 
 
-class LMCacheConnectorV1(KVConnectorBase_V1):
+class LMCacheConnectorV1(KVConnectorBase_V1, SupportsHMA):
     @classmethod
     def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
         """
@@ -338,6 +339,19 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
             returned by the engine.
         """
         return self._lmcache_engine.request_finished(request, block_ids)
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """HMA support: handle multi-group KV cache.
+
+        For hybrid models like Qwen3.5, block_ids is a tuple with one list
+        per KV cache group. We delegate to group 0 (full attention layers)
+        since LMCache only caches standard KV entries.
+        """
+        return self.request_finished(request, block_ids[0])
 
     def take_events(self) -> Iterable["KVCacheEvent"]:
         """
