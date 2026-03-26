@@ -329,15 +329,17 @@ class OpenAIServingResponses(OpenAIServing):
             )
         return None
 
-    async def create_responses(
+    async def render_responses_request(
         self,
         request: ResponsesRequest,
-        raw_request: Request | None = None,
-    ) -> (
-        AsyncGenerator[StreamingResponsesResponse, None]
-        | ResponsesResponse
-        | ErrorResponse
     ):
+        """
+        Render response request by validating and preprocessing inputs.
+
+        Returns:
+            A tuple of (messages, engine_prompts) on success,
+            or an ErrorResponse on failure.
+        """
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             logger.error("Error with model %s", error_check_ret)
@@ -372,10 +374,7 @@ class OpenAIServingResponses(OpenAIServing):
             prev_response = None
 
         try:
-            lora_request = self._maybe_get_adapters(request)
-            model_name = self.models.model_name(lora_request)
             renderer = self.engine_client.renderer
-            tokenizer = renderer.get_tokenizer()
 
             if self.use_harmony:
                 messages, engine_prompts = self._make_request_with_harmony(
@@ -386,6 +385,8 @@ class OpenAIServingResponses(OpenAIServing):
                     request, prev_response, renderer
                 )
 
+            return messages, engine_prompts
+
         except (
             ValueError,
             TypeError,
@@ -395,6 +396,26 @@ class OpenAIServingResponses(OpenAIServing):
         ) as e:
             logger.exception("Error in preprocessing prompt inputs")
             return self.create_error_response(e)
+
+    async def create_responses(
+        self,
+        request: ResponsesRequest,
+        raw_request: Request | None = None,
+    ) -> (
+        AsyncGenerator[StreamingResponsesResponse, None]
+        | ResponsesResponse
+        | ErrorResponse
+    ):
+        result = await self.render_responses_request(request)
+        if isinstance(result, ErrorResponse):
+            return result
+
+        messages, engine_prompts = result
+
+        lora_request = self._maybe_get_adapters(request)
+        model_name = self.models.model_name(lora_request)
+        renderer = self.engine_client.renderer
+        tokenizer = renderer.get_tokenizer()
 
         request_metadata = RequestResponseMetadata(request_id=request.request_id)
         if raw_request:
