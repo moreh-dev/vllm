@@ -1005,8 +1005,18 @@ def wait_for_engine_startup(
         if len(events) > 1 or events[0][0] != handshake_socket:
             # One of the local core processes exited.
             finished = proc_manager.finished_procs() if proc_manager else {}
+            if proc_manager is not None and not finished:
+                finished = {
+                    proc.name: proc.exitcode
+                    for proc in proc_manager.processes
+                    if proc.exitcode is not None
+                }
             if coord_process is not None and coord_process.exitcode is not None:
                 finished[coord_process.name] = coord_process.exitcode
+            logger.error(
+                "Engine startup poll observed process exit before READY: finished=%s",
+                finished,
+            )
             raise RuntimeError(
                 "Engine core initialization failed. "
                 "See root cause above. "
@@ -1023,6 +1033,14 @@ def wait_for_engine_startup(
             )
         msg = msgspec.msgpack.decode(ready_msg_bytes)
         status, local, headless = msg["status"], msg["local"], msg["headless"]
+        logger.info(
+            "Engine startup handshake message: engine=%d status=%s local=%s headless=%s state=%s",  # noqa: E501
+            eng_index,
+            status,
+            local,
+            headless,
+            engine.state.name,
+        )
         if local != engine.local:
             raise RuntimeError(
                 f"{status} message from "
@@ -1068,6 +1086,13 @@ def wait_for_engine_startup(
             conn_pending[0 if local else 1] -= 1
             start_pending[0 if local else 1] += 1
             engine.state = CoreEngineState.CONNECTED
+            logger.info(
+                "Engine startup HELLO accepted: engine=%d local=%s conn_pending=%s start_pending=%s",  # noqa: E501
+                eng_index,
+                local,
+                conn_pending,
+                start_pending,
+            )
         elif status == "READY" and engine.state == CoreEngineState.CONNECTED:
             # Setup KV cache config with initialization state from
             # engine core process. Sum values from all engines in DP case.
@@ -1101,6 +1126,14 @@ def wait_for_engine_startup(
 
             start_pending[0 if local else 1] -= 1
             engine.state = CoreEngineState.READY
+            logger.info(
+                "Engine startup READY accepted: engine=%d local=%s conn_pending=%s start_pending=%s num_gpu_blocks=%s",  # noqa: E501
+                eng_index,
+                local,
+                conn_pending,
+                start_pending,
+                msg["num_gpu_blocks"],
+            )
         else:
             raise RuntimeError(
                 f"Unexpected {status} message for "

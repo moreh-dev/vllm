@@ -37,6 +37,29 @@ AggregateStatLoggerFactory = type["AggregateStatLoggerBase"]
 StatLoggerFactory = AggregateStatLoggerFactory | PerEngineStatLoggerFactory
 
 
+def _safe_counter_increment(
+    value: int | float,
+    *,
+    metric_name: str,
+    engine_idx: int,
+) -> int | float:
+    """Counters must never receive negative increments.
+
+    Remote-prefill failure recovery can transiently produce inconsistent
+    per-iteration accounting. Metrics should not take down serving in that
+    case, so clamp the increment at zero and keep the request path alive.
+    """
+    if value < 0:
+        logger.warning(
+            "Skipping negative counter increment: metric=%s engine=%d value=%s",
+            metric_name,
+            engine_idx,
+            value,
+        )
+        return 0
+    return value
+
+
 class StatLoggerBase(ABC):
     """Interface for logging metrics.
 
@@ -1113,17 +1136,43 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         self.counter_num_preempted_reqs[engine_idx].inc(
             iteration_stats.num_preempted_reqs
         )
-        self.counter_prompt_tokens[engine_idx].inc(iteration_stats.num_prompt_tokens)
+        self.counter_prompt_tokens[engine_idx].inc(
+            _safe_counter_increment(
+                iteration_stats.num_prompt_tokens,
+                metric_name="prompt_tokens",
+                engine_idx=engine_idx,
+            )
+        )
         # Labeled prompt token counters by source
         pts = iteration_stats.prompt_token_stats
         for source in PromptTokenStats.ALL_SOURCES:
             self.counter_prompt_tokens_by_source[source][engine_idx].inc(
-                pts.get_by_source(source)
+                _safe_counter_increment(
+                    pts.get_by_source(source),
+                    metric_name=f"prompt_tokens_by_source.{source}",
+                    engine_idx=engine_idx,
+                )
             )
-        self.counter_prompt_tokens_cached[engine_idx].inc(pts.cached_tokens)
-        self.counter_prompt_tokens_recomputed[engine_idx].inc(pts.recomputed_tokens)
+        self.counter_prompt_tokens_cached[engine_idx].inc(
+            _safe_counter_increment(
+                pts.cached_tokens,
+                metric_name="prompt_tokens_cached",
+                engine_idx=engine_idx,
+            )
+        )
+        self.counter_prompt_tokens_recomputed[engine_idx].inc(
+            _safe_counter_increment(
+                pts.recomputed_tokens,
+                metric_name="prompt_tokens_recomputed",
+                engine_idx=engine_idx,
+            )
+        )
         self.counter_generation_tokens[engine_idx].inc(
-            iteration_stats.num_generation_tokens
+            _safe_counter_increment(
+                iteration_stats.num_generation_tokens,
+                metric_name="generation_tokens",
+                engine_idx=engine_idx,
+            )
         )
         self.histogram_iteration_tokens[engine_idx].observe(
             iteration_stats.num_prompt_tokens + iteration_stats.num_generation_tokens

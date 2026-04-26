@@ -955,6 +955,13 @@ class EngineCoreProc(EngineCore):
             bind=False,
         ) as handshake_socket:
             # Register engine with front-end.
+            logger.info(
+                "EngineCore handshake starting: local_client=%s headless=%s identity=%s address=%s",  # noqa: E501
+                local_client,
+                headless,
+                int.from_bytes(identity, "little"),
+                handshake_address,
+            )
             addresses = self.startup_handshake(
                 handshake_socket, local_client, headless, parallel_config_to_update
             )
@@ -980,7 +987,20 @@ class EngineCoreProc(EngineCore):
                     vllm_config.parallel_config.compute_hash()
                 )
 
+            logger.info(
+                "EngineCore initialization complete: local_client=%s headless=%s identity=%s num_gpu_blocks=%s",  # noqa: E501
+                local_client,
+                headless,
+                int.from_bytes(identity, "little"),
+                num_gpu_blocks,
+            )
             handshake_socket.send(msgspec.msgpack.encode(ready_msg))
+            logger.info(
+                "EngineCore READY sent: local_client=%s headless=%s identity=%s",
+                local_client,
+                headless,
+                int.from_bytes(identity, "little"),
+            )
 
     @staticmethod
     def startup_handshake(
@@ -1090,6 +1110,11 @@ class EngineCoreProc(EngineCore):
                 engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
 
             assert engine_core is not None
+            logger.info(
+                "EngineCoreProc initialization returned from EngineCore: dp_rank=%d local_dp_rank=%d",  # noqa: E501
+                dp_rank,
+                local_dp_rank,
+            )
             engine_core.run_busy_loop()
 
         except SystemExit:

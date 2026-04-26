@@ -49,7 +49,13 @@ class MooncakeBootstrapServer:
         self.server: uvicorn.Server | None = None
 
     def __del__(self):
-        self.shutdown()
+        try:
+            self.shutdown()
+        except Exception:
+            # Destructors may run on partially constructed instances when
+            # callers probe multiple constructor signatures across versions.
+            # Swallow cleanup errors to avoid masking the original failure.
+            pass
 
     def _register_routes(self):
         # All methods are async. No need to use lock to protect data.
@@ -71,11 +77,13 @@ class MooncakeBootstrapServer:
         logger.info("Mooncake Bootstrap Server started at %s:%d", self.host, self.port)
 
     def shutdown(self):
-        if self.server_thread is None or self.server is None or not self.server.started:
+        server_thread = getattr(self, "server_thread", None)
+        server = getattr(self, "server", None)
+        if server_thread is None or server is None or not server.started:
             return
 
-        self.server.should_exit = True
-        self.server_thread.join()
+        server.should_exit = True
+        server_thread.join()
         logger.info("Mooncake Bootstrap Server stopped.")
 
     async def register_worker(self, payload: RegisterWorkerPayload):

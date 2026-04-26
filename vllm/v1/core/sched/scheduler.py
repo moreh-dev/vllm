@@ -1759,6 +1759,11 @@ class Scheduler(SchedulerInterface):
         delay_free_blocks |= connector_delay_free_blocks
         if not delay_free_blocks:
             self._free_blocks(request)
+        elif hasattr(self.kv_cache_manager, "release_slot"):
+            # P/D producers may need to keep KV blocks alive until async
+            # transfer completes. That should not keep consuming a TT internal
+            # DP scheduler slot after the request itself is finished.
+            self.kv_cache_manager.release_slot(request)
 
         return kv_xfer_params
 

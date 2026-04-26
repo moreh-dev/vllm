@@ -604,6 +604,10 @@ class MPClient(EngineCoreClient):
             # Wait for ready messages from each engine on the input socket.
             identities = set(self.core_engines)
             sync_input_socket = zmq.Socket.shadow(self.input_socket)
+            logger.info(
+                "EngineCore input sockets ready: awaiting READY identities=%s",
+                [int.from_bytes(identity, "little") for identity in self.core_engines],
+            )
             while identities:
                 if not sync_input_socket.poll(
                     timeout=VLLM_ENGINE_READY_TIMEOUT_S * 1000  # convert to ms
@@ -619,6 +623,11 @@ class MPClient(EngineCoreClient):
                     )
                 identity, _ = sync_input_socket.recv_multipart()
                 identities.remove(identity)
+                logger.info(
+                    "EngineCore frontend received READY identity=%d remaining=%s",
+                    int.from_bytes(identity, "little"),
+                    [int.from_bytes(pending, "little") for pending in identities],
+                )
 
             self.core_engine: EngineIdentity = self.core_engines[0]
             self.utility_results: dict[int, AnyFuture] = {}

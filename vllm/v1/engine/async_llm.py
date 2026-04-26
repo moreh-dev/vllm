@@ -698,12 +698,18 @@ class AsyncLLM(EngineClient):
                     # TODO(rob): make into a coroutine and launch it in
                     # background thread once Prometheus overhead is non-trivial.
                     if logger_ref[0]:
-                        logger_ref[0].record(
-                            engine_idx=outputs.engine_index,
-                            scheduler_stats=outputs.scheduler_stats,
-                            iteration_stats=iteration_stats,
-                            mm_cache_stats=renderer.stat_mm_cache(),
-                        )
+                        try:
+                            logger_ref[0].record(
+                                engine_idx=outputs.engine_index,
+                                scheduler_stats=outputs.scheduler_stats,
+                                iteration_stats=iteration_stats,
+                                mm_cache_stats=renderer.stat_mm_cache(),
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Stat logger record failed; continuing "
+                                "without propagating the error."
+                            )
             except Exception as e:
                 logger.exception("AsyncLLM output_handler failed.")
                 output_processor.propagate_error(e)

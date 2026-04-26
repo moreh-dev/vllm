@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import os
 import threading
 import time
 from collections import defaultdict
@@ -66,6 +67,15 @@ TransferId = str  # KV transfer coordination ID (shared by P/D)
 logger = init_logger(__name__)
 
 
+def _producer_trace_enabled() -> bool:
+    return os.environ.get("VLLM_MOONCAKE_PRODUCER_TRACE", "0") == "1"
+
+
+def _producer_trace(msg: str, *args: object) -> None:
+    if _producer_trace_enabled():
+        logger.info("[ProducerTrace] " + msg, *args)
+
+
 class MooncakeXferMetadata(
     msgspec.Struct,
     omit_defaults=True,  # type: ignore[call-arg]
@@ -76,6 +86,9 @@ class MooncakeXferMetadata(
     remote_tp_rank: int
     req_blocks: dict[ReqId, tuple[TransferId, list[int]]]
     kv_caches_base_addr: list[int]
+    # Layer 2' (READ pull): if non-empty, this is an ACK for transfers already
+    # read-completed by the consumer. Producer uses this to free blocks.
+    ack_for_transfers: list[TransferId] = []
 
 
 class MooncakeXferResponseStatus(IntEnum):
@@ -85,6 +98,8 @@ class MooncakeXferResponseStatus(IntEnum):
     CONTINUE = 1
     # Something wrong, see err_msg
     ERROR = 2
+    # Layer 2' ACK was processed by producer.
+    ACK_OK = 3
 
 
 class MooncakeXferResponse(
@@ -95,6 +110,13 @@ class MooncakeXferResponse(
     ok_reqs: list[ReqId] | None = None
     err_reqs: list[ReqId] | None = None
     err_msg: str | None = None
+    # Layer 2' (READ pull): when set, consumer must perform
+    # batch_transfer_sync_read(p_session, p_dst_ptrs, p_src_ptrs, p_lengths).
+    # The sync_read return guarantees GPU memory landing (cudaMemcpy synced).
+    p_session: str | None = None
+    p_src_ptrs: list[int] | None = None
+    p_dst_ptrs: list[int] | None = None
+    p_lengths: list[int] | None = None
 
 
 @dataclass
@@ -120,6 +142,7 @@ class SendBlockMeta:
     need_send: int = 0
     sent: int = 0
     sending: int = 0
+    acked_remote_tp_ranks: set[int] | None = None
 
 
 class MooncakeConnectorMetadata(KVConnectorMetadata):
@@ -354,6 +377,14 @@ class MooncakeConnectorScheduler:
             else:
                 # Add an empty list to worker to create event.
                 self._reqs_need_send[request.request_id] = (request, [])
+                _producer_trace(
+                    "prefill_enqueue req=%s transfer=%s prompt_tokens=%d "
+                    "external_tokens=%d placeholder_blocks=0",
+                    request.request_id,
+                    params["transfer_id"],
+                    len(request.prompt_token_ids or []),
+                    num_external_tokens,
+                )
 
     def build_connector_meta(
         self,
@@ -380,6 +411,12 @@ class MooncakeConnectorScheduler:
                     local_block_ids=block_ids,
                     kv_transfer_params=req.kv_transfer_params,
                     load_remote_cache=False,
+                )
+                _producer_trace(
+                    "build_meta_send req=%s transfer=%s blocks=%d",
+                    req_id,
+                    req.kv_transfer_params["transfer_id"],
+                    len(block_ids),
                 )
             self._reqs_need_send.clear()
             meta.reqs_not_processed = self._reqs_not_processed
@@ -429,6 +466,12 @@ class MooncakeConnectorScheduler:
             # Also include the case of a P/D Prefill request with immediate
             # block free (eg abort). Stop tracking this request.
             self._reqs_not_processed.add(params["transfer_id"])
+            _producer_trace(
+                "prefill_drop req=%s transfer=%s status=%s",
+                request.request_id,
+                params["transfer_id"],
+                request.status,
+            )
             return False, None
 
         # TODO: check whether block_ids actually ever be 0. If not we could
@@ -437,6 +480,12 @@ class MooncakeConnectorScheduler:
 
         if delay_free_blocks:
             self._reqs_need_send[request.request_id] = (request, block_ids)
+            _producer_trace(
+                "prefill_ready req=%s transfer=%s blocks=%d",
+                request.request_id,
+                params["transfer_id"],
+                len(block_ids),
+            )
 
         return delay_free_blocks, None
 
@@ -484,8 +533,19 @@ class MooncakeConnectorWorker:
         self._pending_bootstrap_querys: dict[str, asyncio.Event] = {}
         self.side_channel_port: int = 0  # we will bind it in register_kv_caches()
         self.engine_id: EngineId = engine_id
-        self.tp_rank = get_tensor_model_parallel_rank()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        try:
+            self.tp_rank = get_tensor_model_parallel_rank()
+            self.tp_size = get_tensor_model_parallel_world_size()
+        except AssertionError:
+            # TT backend runs one vLLM worker over a multi-device mesh and does
+            # not initialize vLLM TP group. Treat it as one logical worker;
+            # virtual TP registration below advertises GPU-facing TP ranks.
+            logger.warning(
+                "Mooncake worker using TP fallback rank=0 size=1; "
+                "vLLM TP group is not initialized"
+            )
+            self.tp_rank = 0
+            self.tp_size = 1
         self.num_blocks = 0
 
         assert (parallel_config := vllm_config.parallel_config)
@@ -497,7 +557,10 @@ class MooncakeConnectorWorker:
             raise ValueError(
                 "Mooncake Transfer Engine does not support pipeline parallelism yet."
             )
-        self.pp_rank = get_pp_group().rank_in_group
+        try:
+            self.pp_rank = get_pp_group().rank_in_group
+        except AssertionError:
+            self.pp_rank = 0
 
         self.kv_caches_base_addr: list[int] = []
         self.device_kv_caches: dict[str, torch.Tensor] = {}
@@ -526,9 +589,15 @@ class MooncakeConnectorWorker:
             # Start bootstrap server on global rank 0.
             if should_launch_bootstrap_server(vllm_config):
                 _, port = get_mooncake_bootstrap_addr(vllm_config)
-                self.bootstrap_server = MooncakeBootstrapServer(
-                    vllm_config, "0.0.0.0", port
-                )
+                # vLLM bootstrap server signature changed across versions.
+                # Newer vLLM expects (host, port); older expects
+                # (vllm_config, host, port).
+                try:
+                    self.bootstrap_server = MooncakeBootstrapServer("0.0.0.0", port)
+                except TypeError:
+                    self.bootstrap_server = MooncakeBootstrapServer(
+                        vllm_config, "0.0.0.0", port
+                    )
                 self.bootstrap_server.start()
 
         if not self.is_kv_producer:
@@ -593,31 +662,53 @@ class MooncakeConnectorWorker:
         host, port = get_mooncake_bootstrap_addr(self.vllm_config)
         url = make_zmq_path("http", host, port) + "/register"
         worker_addr = make_zmq_path("tcp", self.hostname, self.side_channel_port)
-        payload = RegisterWorkerPayload(
-            engine_id=self.engine_id,
-            dp_rank=self.dp_rank,
-            tp_rank=self.tp_rank,
-            pp_rank=self.pp_rank,
-            addr=worker_addr,
+        _producer_trace(
+            "bootstrap_register_begin engine=%s worker=%s url=%s",
+            self.engine_id,
+            worker_addr,
+            url,
         )
-        while True:
-            try:
-                async with httpx.AsyncClient() as client:
-                    response = await client.post(url, json=payload.model_dump())
-                    response.raise_for_status()
-                logger.debug("Successfully registered with bootstrap server at %s", url)
-                break
-            except httpx.ConnectError:
-                # Bootstrap server not ready, wait for a while and retry.
-                await asyncio.sleep(1)
-            except Exception as e:
-                err_msg = (
-                    e.response.text if isinstance(e, httpx.HTTPStatusError) else str(e)
-                )
-                logger.error(
-                    "Error registering %s with bootstrap server: %s", payload, err_msg
-                )
-                raise e
+        # For NPU single-worker: register as multiple TP ranks so that
+        # GPU consumers with higher TP can connect (heterogeneous TP workaround).
+        # The actual KV data is already TP-gathered (full tensor).
+        num_virtual_tp = int(os.environ.get("VLLM_MOONCAKE_VIRTUAL_TP_SIZE", "0"))
+        tp_ranks_to_register = list(range(num_virtual_tp)) if num_virtual_tp > 0 else [self.tp_rank]
+        for vtp_rank in tp_ranks_to_register:
+            payload = RegisterWorkerPayload(
+                engine_id=self.engine_id,
+                dp_rank=self.dp_rank,
+                tp_rank=vtp_rank,
+                pp_rank=self.pp_rank,
+                addr=worker_addr,
+            )
+            while True:
+                try:
+                    async with httpx.AsyncClient() as client:
+                        response = await client.post(url, json=payload.model_dump())
+                        response.raise_for_status()
+                    logger.debug("Registered tp_rank=%d with bootstrap server at %s", vtp_rank, url)
+                    _producer_trace(
+                        "bootstrap_register_ok tp_rank=%d worker=%s",
+                        vtp_rank,
+                        worker_addr,
+                    )
+                    break
+                except httpx.ConnectError:
+                    # Bootstrap server not ready, wait for a while and retry.
+                    await asyncio.sleep(1)
+                except Exception as e:
+                    err_msg = (
+                        e.response.text if isinstance(e, httpx.HTTPStatusError) else str(e)
+                    )
+                    logger.error(
+                        "Error registering %s with bootstrap server: %s", payload, err_msg
+                    )
+                    _producer_trace(
+                        "bootstrap_register_error tp_rank=%d err=%s",
+                        vtp_rank,
+                        err_msg,
+                    )
+                    raise e
 
     async def _mooncake_sender_listener(self, ready_event: threading.Event):
         """
@@ -627,6 +718,11 @@ class MooncakeConnectorWorker:
 
         sock = self.async_zmq_ctx.socket(zmq.ROUTER)
         self.side_channel_port = sock.bind_to_random_port(f"tcp://{self.hostname}")
+        _producer_trace(
+            "sender_listener_bound host=%s side_channel_port=%d",
+            self.hostname,
+            self.side_channel_port,
+        )
         logger.debug(
             "Mooncake sender starting listening on path: tcp://%s:%d",
             self.hostname,
@@ -642,6 +738,12 @@ class MooncakeConnectorWorker:
         ]
 
         ready_event.set()
+        _producer_trace(
+            "sender_listener_ready host=%s side_channel_port=%d sender_tasks=%d",
+            self.hostname,
+            self.side_channel_port,
+            self.num_sender_tasks,
+        )
 
         try:
             while True:
@@ -664,7 +766,50 @@ class MooncakeConnectorWorker:
                 identity, metadata_bytes = await self.sender_worker_queue.get()
                 try:
                     metadata = self._xfer_meta_decoder.decode(metadata_bytes)
-                    await self.send_kv_to_decode(identity, sock, metadata)
+                    logger.debug(
+                        "Mooncake side-channel received: reqs=%s ack=%s "
+                        "remote=%s:%s remote_tp_size=%s remote_tp_rank=%s",
+                        list(metadata.req_blocks),
+                        metadata.ack_for_transfers,
+                        metadata.remote_hostname,
+                        metadata.remote_port,
+                        metadata.remote_tp_size,
+                        metadata.remote_tp_rank,
+                    )
+                    if metadata.ack_for_transfers:
+                        _producer_trace(
+                            "ack_recv transfers=%s remote_tp_rank=%s",
+                            metadata.ack_for_transfers,
+                            metadata.remote_tp_rank,
+                        )
+                    else:
+                        _producer_trace(
+                            "pull_req_recv reqs=%s remote=%s:%s remote_tp_rank=%s "
+                            "remote_tp_size=%s",
+                            list(metadata.req_blocks),
+                            metadata.remote_hostname,
+                            metadata.remote_port,
+                            metadata.remote_tp_rank,
+                            metadata.remote_tp_size,
+                        )
+                    # Layer 2' (READ pull): ACK from consumer after sync_read done
+                    if metadata.ack_for_transfers:
+                        self._handle_read_ack(
+                            metadata.ack_for_transfers, metadata.remote_tp_rank
+                        )
+                        # Send ACK_OK handshake reply so consumer knows we got it
+                        ack_ok = MooncakeXferResponse(
+                            status=MooncakeXferResponseStatus.ACK_OK,
+                        )
+                        await sock.send_multipart(
+                            (identity, self._encoder.encode(ack_ok))
+                        )
+                        logger.warning(
+                            "Mooncake side-channel sent ACK_OK: transfers=%s",
+                            metadata.ack_for_transfers,
+                        )
+                    else:
+                        await self.send_kv_to_decode(identity, sock, metadata)
                 except Exception as e:
                     logger.error("Error processing Mooncake xfer request: %s", e)
                     error_response = MooncakeXferResponse(
@@ -679,6 +824,41 @@ class MooncakeConnectorWorker:
                 break
             except Exception as e:
                 logger.error("Error in _sender_worker: %s", e)
+
+    def _handle_read_ack(
+        self, transfer_ids: list[TransferId], remote_tp_rank: int
+    ):
+        """Layer 2' (READ pull): consumer ACKed that batch_transfer_sync_read
+        completed — now safe to free producer-side blocks."""
+        for transfer_id in transfer_ids:
+            if transfer_id not in self.reqs_need_send:
+                continue
+            send_meta = self.reqs_need_send[transfer_id]
+            if send_meta.acked_remote_tp_ranks is None:
+                send_meta.acked_remote_tp_ranks = set()
+            if remote_tp_rank in send_meta.acked_remote_tp_ranks:
+                continue
+            send_meta.acked_remote_tp_ranks.add(remote_tp_rank)
+            send_meta.sending = max(0, send_meta.sending - 1)
+            send_meta.sent += 1
+            _producer_trace(
+                "ack_apply transfer=%s p_req=%s remote_tp_rank=%s "
+                "sent=%d need_send=%d sending=%d",
+                transfer_id,
+                send_meta.p_req_id,
+                remote_tp_rank,
+                send_meta.sent,
+                send_meta.need_send,
+                send_meta.sending,
+            )
+            if send_meta.sent == send_meta.need_send:
+                del self.reqs_need_send[transfer_id]
+                self.finished_sending_reqs.add(send_meta.p_req_id)
+                _producer_trace(
+                    "ack_finish transfer=%s p_req=%s",
+                    transfer_id,
+                    send_meta.p_req_id,
+                )
 
     async def send_kv_to_decode(
         self, identity: bytes, sock: zmq.asyncio.Socket, meta: MooncakeXferMetadata
@@ -704,8 +884,31 @@ class MooncakeConnectorWorker:
                     local_block_ids=[],
                     ready=asyncio.Event(),
                 )
+                logger.debug(
+                    "Mooncake side-channel created pending send placeholder: "
+                    "d_req=%s transfer=%s",
+                    d_req_id,
+                    transfer_id,
+                )
             send_meta = self.reqs_need_send[transfer_id]
             pending_reqs[d_req_id] = send_meta
+            logger.warning(
+                "Mooncake side-channel waiting for ready: d_req=%s "
+                "transfer=%s ready=%s local_blocks=%d p_req=%s",
+                d_req_id,
+                transfer_id,
+                send_meta.ready.is_set(),
+                len(send_meta.local_block_ids),
+                send_meta.p_req_id,
+            )
+            _producer_trace(
+                "pull_wait_ready d_req=%s transfer=%s ready=%s local_blocks=%d p_req=%s",
+                d_req_id,
+                transfer_id,
+                send_meta.ready.is_set(),
+                len(send_meta.local_block_ids),
+                send_meta.p_req_id,
+            )
 
         async def wait_and_ret(
             d_req_id: ReqId, send_meta: SendBlockMeta
@@ -757,71 +960,157 @@ class MooncakeConnectorWorker:
                     if not send_meta.need_send:
                         self.resolve_need_send(send_meta, remote_tp_ranks)
                     ready_reqs.append((d_req_id, send_meta))
+                    _producer_trace(
+                        "pull_ready d_req=%s transfer=%s p_req=%s blocks=%d need_send=%d",
+                        d_req_id,
+                        send_meta.transfer_id,
+                        send_meta.p_req_id,
+                        len(send_meta.local_block_ids),
+                        send_meta.need_send,
+                    )
                 else:
                     # Otherwise (expired, very unlikely), just forget it.
                     logger.warning(
                         "Request %s expired before sending on P side.", d_req_id
                     )
 
-            src_ptrs, dst_ptrs, lengths, err_reqs = await self._build_transfer_params(
-                ready_reqs, meta
+            max_reqs_per_response = int(
+                os.environ.get("VLLM_MOONCAKE_MAX_REQS_PER_RESPONSE", "8")
+            )
+            ready_req_chunks = self._chunk_ready_reqs(
+                ready_reqs, max_reqs_per_response
             )
 
-            if err_reqs:
-                response = MooncakeXferResponse(
-                    status=response_status,
-                    err_reqs=err_reqs,
-                    err_msg="P num blocks less than D",
-                )
-                await sock.send_multipart((identity, self._encoder.encode(response)))
+            # Layer 2' (READ pull) env gate
+            use_read_pull = os.environ.get(
+                "VLLM_MOONCAKE_USE_READ_PULL", "0"
+            ) == "1"
 
-            if src_ptrs:
-                remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
-                ret_value = await self.sender_loop.run_in_executor(
-                    self._sender_executor,
-                    self._send_blocks,
-                    remote_session,
-                    src_ptrs,
-                    dst_ptrs,
-                    lengths,
+            for chunk_idx, ready_req_chunk in enumerate(ready_req_chunks):
+                chunk_status = (
+                    response_status
+                    if chunk_idx == len(ready_req_chunks) - 1
+                    else MooncakeXferResponseStatus.CONTINUE
+                )
+                src_ptrs, dst_ptrs, lengths, err_reqs = (
+                    await self._build_transfer_params(ready_req_chunk, meta)
+                )
+                logger.warning(
+                    "Mooncake side-channel built transfer params: ok_reqs=%s "
+                    "src_ptrs=%d dst_ptrs=%d lengths=%d err_reqs=%s "
+                    "chunk=%d/%d max_reqs_per_response=%d",
+                    [d_req_id for d_req_id, _ in ready_req_chunk],
+                    len(src_ptrs),
+                    len(dst_ptrs),
+                    len(lengths),
+                    err_reqs,
+                    chunk_idx + 1,
+                    len(ready_req_chunks),
+                    max_reqs_per_response,
+                )
+                _producer_trace(
+                    "pull_chunk reqs=%s chunk=%d/%d src_ptrs=%d lengths=%d err=%s",
+                    [d_req_id for d_req_id, _ in ready_req_chunk],
+                    chunk_idx + 1,
+                    len(ready_req_chunks),
+                    len(src_ptrs),
+                    len(lengths),
+                    err_reqs,
                 )
 
-                if ret_value != 0:
-                    err_reqs = []
-                    for d_req_id, send_meta in ready_reqs:
-                        send_meta.sending -= 1
-                        err_reqs.append(d_req_id)
-                    # Do best effort to transfer the remaining reqs.
+                if err_reqs:
                     response = MooncakeXferResponse(
-                        status=response_status,
+                        status=chunk_status,
                         err_reqs=err_reqs,
-                        err_msg=f"Mooncake transfer engine returned {ret_value}",
+                        err_msg="P num blocks less than D",
                     )
                     await sock.send_multipart(
                         (identity, self._encoder.encode(response))
                     )
-                    continue
 
-            for d_req_id, send_meta in ready_reqs:
-                # TODO: for heterogeneous TP (one P pairs to multiple D),
-                # we need to check whether all headers are sent.
-                # If not, we should set expire_time to normal and skip the below.
-                send_meta.sending -= 1
-                send_meta.sent += 1
-                if send_meta.sent == send_meta.need_send:
-                    del self.reqs_need_send[send_meta.transfer_id]
-                    self.finished_sending_reqs.add(send_meta.p_req_id)
+                if src_ptrs and not use_read_pull:
+                    # Original WRITE push path
+                    remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
+                    ret_value = await self.sender_loop.run_in_executor(
+                        self._sender_executor,
+                        self._send_blocks,
+                        remote_session,
+                        src_ptrs,
+                        dst_ptrs,
+                        lengths,
+                    )
 
-            response = MooncakeXferResponse(
-                status=response_status,
-                ok_reqs=[d_req_id for d_req_id, _ in ready_reqs],
-            )
-            await sock.send_multipart((identity, self._encoder.encode(response)))
+                    if ret_value != 0:
+                        err_reqs = []
+                        for d_req_id, send_meta in ready_req_chunk:
+                            send_meta.sending -= 1
+                            err_reqs.append(d_req_id)
+                        # Do best effort to transfer the remaining reqs.
+                        response = MooncakeXferResponse(
+                            status=chunk_status,
+                            err_reqs=err_reqs,
+                            err_msg=f"Mooncake transfer engine returned {ret_value}",
+                        )
+                        await sock.send_multipart(
+                            (identity, self._encoder.encode(response))
+                        )
+                        continue
+
+                if not use_read_pull:
+                    # WRITE push: transfer done, mark sent immediately.
+                    for d_req_id, send_meta in ready_req_chunk:
+                        send_meta.sending -= 1
+                        send_meta.sent += 1
+                        if send_meta.sent == send_meta.need_send:
+                            del self.reqs_need_send[send_meta.transfer_id]
+                            self.finished_sending_reqs.add(send_meta.p_req_id)
+
+                    response = MooncakeXferResponse(
+                        status=chunk_status,
+                        ok_reqs=[d_req_id for d_req_id, _ in ready_req_chunk],
+                    )
+                else:
+                    # READ pull: include src/dst metadata; defer sent/finished
+                    # until consumer sends ACK (via _handle_read_ack).
+                    p_session = (
+                        f"{self.hostname}:{self.rpc_port}" if src_ptrs else None
+                    )
+                    response = MooncakeXferResponse(
+                        status=chunk_status,
+                        ok_reqs=[d_req_id for d_req_id, _ in ready_req_chunk],
+                        p_session=p_session,
+                        p_src_ptrs=src_ptrs if src_ptrs else None,
+                        p_dst_ptrs=dst_ptrs if src_ptrs else None,
+                        p_lengths=lengths if src_ptrs else None,
+                    )
+
+                await sock.send_multipart((identity, self._encoder.encode(response)))
+                logger.warning(
+                    "Mooncake side-channel sent response: status=%s ok=%s err=%s "
+                    "p_session=%s ptrs=%d chunk=%d/%d",
+                    response.status.name,
+                    response.ok_reqs,
+                    response.err_reqs,
+                    response.p_session,
+                    len(response.p_src_ptrs or []),
+                    chunk_idx + 1,
+                    len(ready_req_chunks),
+                )
+                _producer_trace(
+                    "pull_reply status=%s ok=%s err=%s ptrs=%d chunk=%d/%d",
+                    response.status.name,
+                    response.ok_reqs,
+                    response.err_reqs,
+                    len(response.p_src_ptrs or []),
+                    chunk_idx + 1,
+                    len(ready_req_chunks),
+                )
 
     def resolve_need_send(self, send_meta: SendBlockMeta, remote_tp_ranks: list[int]):
         # Prepare for heterogeneous TP (one P pairs to multiple D)
         send_meta.need_send = len(remote_tp_ranks)
-        if send_meta.need_send != 1:
+        num_virtual_tp = int(os.environ.get("VLLM_MOONCAKE_VIRTUAL_TP_SIZE", "0"))
+        if send_meta.need_send != 1 and num_virtual_tp == 0:
             logger.error("Mooncake: Heterogeneous TP is not supported yet.")
             raise NotImplementedError(
                 "Mooncake: Heterogeneous TP is not supported yet."
@@ -889,6 +1178,19 @@ class MooncakeConnectorWorker:
             )
 
         return src_ptrs, dst_ptrs, lengths, err_reqs
+
+    @staticmethod
+    def _chunk_ready_reqs(
+        ready_reqs: list[tuple[ReqId, SendBlockMeta]],
+        max_reqs_per_response: int,
+    ) -> list[list[tuple[ReqId, SendBlockMeta]]]:
+        if max_reqs_per_response <= 0 or len(ready_reqs) <= max_reqs_per_response:
+            return [ready_reqs]
+
+        return [
+            ready_reqs[i:i + max_reqs_per_response]
+            for i in range(0, len(ready_reqs), max_reqs_per_response)
+        ]
 
     def _send_blocks(
         self,
@@ -966,10 +1268,25 @@ class MooncakeConnectorWorker:
             return
 
         ready_event = threading.Event()
-        asyncio.run_coroutine_threadsafe(
+        listener_future = asyncio.run_coroutine_threadsafe(
             self._mooncake_sender_listener(ready_event), self.sender_loop
         )
-        ready_event.wait()  # Wait for listener ZMQ socket to be ready.
+        if not ready_event.wait(timeout=60):
+            if listener_future.done():
+                listener_exc = listener_future.exception()
+                if listener_exc is not None:
+                    raise RuntimeError(
+                        "Mooncake sender listener failed during startup"
+                    ) from listener_exc
+            raise RuntimeError(
+                "Timed out waiting for Mooncake sender listener startup."
+            )
+        if listener_future.done():
+            listener_exc = listener_future.exception()
+            if listener_exc is not None:
+                raise RuntimeError(
+                    "Mooncake sender listener exited unexpectedly during startup"
+                ) from listener_exc
 
     async def fetch_finished_recving_reqs(self) -> set[ReqId]:
         finished_recving_reqs = self.finished_recving_reqs
@@ -1072,9 +1389,16 @@ class MooncakeConnectorWorker:
                     zmq.RCVTIMEO, (envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT + 60) * 1000
                 )
                 await sock.send(encoded_data)
+                pending_responses: list[MooncakeXferResponse] = []
+                use_read_pull = os.environ.get(
+                    "VLLM_MOONCAKE_USE_READ_PULL", "0"
+                ) == "1"
                 while True:
-                    ret_msg = await sock.recv()
-                    response = self._xfer_resp_decoder.decode(ret_msg)
+                    if pending_responses:
+                        response = pending_responses.pop(0)
+                    else:
+                        ret_msg = await sock.recv()
+                        response = self._xfer_resp_decoder.decode(ret_msg)
                     if response.status == MooncakeXferResponseStatus.ERROR:
                         logger.error(
                             "Error happens during tranfering kvcache for %s: %s",
@@ -1082,7 +1406,82 @@ class MooncakeConnectorWorker:
                             response.err_msg,
                         )
                         return
+                    if response.status == MooncakeXferResponseStatus.ACK_OK:
+                        logger.warning(
+                            "Unexpected ACK_OK while receiving KV for %s", req_ids
+                        )
+                        continue
+                    # Layer 2' (READ pull): if producer sent src metadata, we
+                    # perform the sync_read locally. batch_transfer_sync_read
+                    # returns only after cudaMemcpy H2D completes, so the KV
+                    # is guaranteed to be in consumer GPU memory before we
+                    # proceed to mark finished_recving_reqs.
+                    if response.p_session and response.p_src_ptrs:
+                        loop = asyncio.get_running_loop()
+                        ret_value = await loop.run_in_executor(
+                            None,
+                            self.engine.batch_transfer_sync_read,
+                            response.p_session,
+                            response.p_dst_ptrs,
+                            response.p_src_ptrs,
+                            response.p_lengths,
+                        )
+                        if ret_value != 0:
+                            logger.error(
+                                "batch_transfer_sync_read failed for %s: %d",
+                                req_ids,
+                                ret_value,
+                            )
+                            # Don't send ACK on failure; let producer timeout.
+                            return
+
+                    # Layer 2' reliability (review fixes):
+                    # - ACK per response (not only FINISH) so CONTINUE batches
+                    #   are also acked; avoids strand if later FINISH fails.
+                    # - Send ACK even when p_session was None (src_ptrs == [])
+                    #   so producer always finalizes send_meta.sent.
+                    # - Wait for ACK_OK reply from producer before proceeding;
+                    #   guarantees actual delivery, not just local ZMQ queue.
+                    if use_read_pull and response.ok_reqs:
+                        ack_transfer_ids = list(
+                            {
+                                pull_metas[r].transfer_id
+                                for r in response.ok_reqs
+                                if r in pull_metas
+                            }
+                        )
+                        if ack_transfer_ids:
+                            ack_meta = MooncakeXferMetadata(
+                                remote_hostname="",
+                                remote_port=0,
+                                remote_tp_size=0,
+                                remote_tp_rank=self.tp_rank,
+                                req_blocks={},
+                                kv_caches_base_addr=[],
+                                ack_for_transfers=ack_transfer_ids,
+                            )
+                            await sock.send(self._encoder.encode(ack_meta))
+                            # Wait for producer's ACK_OK handshake reply.
+                            try:
+                                while True:
+                                    ack_msg = await sock.recv()
+                                    ack_response = self._xfer_resp_decoder.decode(
+                                        ack_msg
+                                    )
+                                    if (
+                                        ack_response.status
+                                        == MooncakeXferResponseStatus.ACK_OK
+                                    ):
+                                        break
+                                    pending_responses.append(ack_response)
+                            except Exception as e:
+                                logger.error(
+                                    "ACK_OK recv failed for %s: %s", req_ids, e
+                                )
+                                return
+
                     self.process_pulling_result(response, pull_metas)
+
                     if response.status == MooncakeXferResponseStatus.FINISH:
                         break
         except zmq.ContextTerminated:
@@ -1202,6 +1601,19 @@ class MooncakeConnectorWorker:
         for p_req_id, (transfer_id, block_ids) in metadata.reqs_to_send.items():
             if block_ids:
                 # Already gone through request_finished()
+                if transfer_id not in self.reqs_need_send:
+                    self.reqs_need_send[transfer_id] = SendBlockMeta(
+                        p_req_id=p_req_id,
+                        transfer_id=transfer_id,
+                        local_block_ids=[],
+                        ready=asyncio.Event(),
+                    )
+                    logger.warning(
+                        "Mooncake producer created missing send placeholder at "
+                        "ready time: p_req=%s transfer=%s",
+                        p_req_id,
+                        transfer_id,
+                    )
                 send_meta = self.reqs_need_send[transfer_id]
                 send_meta.p_req_id = p_req_id
                 send_meta.local_block_ids = block_ids
@@ -1209,6 +1621,21 @@ class MooncakeConnectorWorker:
                     time.perf_counter() + envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
                 )
                 send_meta.ready.set()
+                _producer_trace(
+                    "send_ready req=%s transfer=%s blocks=%d expire_in=%.1fs",
+                    p_req_id,
+                    transfer_id,
+                    len(block_ids),
+                    envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT,
+                )
+                logger.debug(
+                    "Mooncake producer marked send ready: p_req=%s transfer=%s "
+                    "blocks=%d pending=%d",
+                    p_req_id,
+                    transfer_id,
+                    len(block_ids),
+                    len(self.reqs_need_send),
+                )
             else:
                 # From update_state_after_alloc(),
                 # but not reach request_finished() yet
@@ -1221,8 +1648,15 @@ class MooncakeConnectorWorker:
                         local_block_ids=[],
                         ready=asyncio.Event(),
                     )
+                    logger.debug(
+                        "Mooncake producer registered prefill placeholder: "
+                        "p_req=%s transfer=%s pending=%d",
+                        p_req_id,
+                        transfer_id,
+                        len(self.reqs_need_send),
+                    )
         for transfer_id in metadata.reqs_not_processed:
-            send_meta = self.reqs_need_send.pop(transfer_id)
+            send_meta = self.reqs_need_send.pop(transfer_id, None)
             if send_meta:
                 assert not send_meta.ready.is_set()
 
