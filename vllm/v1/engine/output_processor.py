@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import os
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -11,6 +12,7 @@ import numpy as np
 import torch
 
 from vllm.lora.request import LoRARequest
+from vllm.logger import init_logger
 from vllm.outputs import (
     STREAM_FINISHED,
     CompletionOutput,
@@ -40,6 +42,9 @@ from vllm.v1.metrics.stats import (
 
 # shared empty CPU tensor used as a placeholder pooling output
 EMPTY_CPU_TENSOR = torch.empty(0, device="cpu")
+
+logger = init_logger(__name__)
+_TT_REQ_TIMELINE = os.environ.get("VLLM_TT_REQ_TIMELINE", "0") == "1"
 
 
 class RequestOutputCollector:
@@ -800,8 +805,51 @@ class OutputProcessor:
             req_stats=req_state.stats,
             num_cached_tokens=req_state.num_cached_tokens,
         )
+        self._log_request_timeline(req_state, iteration_stats)
         self.lora_states.request_finished(req_state.request_id, req_state.lora_name)
 
         ParentRequest.observe_finished_request(
             req_state.parent_req, iteration_stats, req_state.stats.num_generation_tokens
+        )
+
+    def _log_request_timeline(
+        self,
+        req_state: RequestState,
+        iteration_stats: IterationStats,
+    ) -> None:
+        if not _TT_REQ_TIMELINE:
+            return
+
+        assert req_state.stats is not None
+        metrics = req_state.stats
+
+        queue_ms = (metrics.scheduled_ts - metrics.queued_ts) * 1000.0
+        scheduled_to_first_ms = (
+            metrics.first_token_ts - metrics.scheduled_ts
+        ) * 1000.0
+        decode_ms = (metrics.last_token_ts - metrics.first_token_ts) * 1000.0
+        e2e_ms = (
+            iteration_stats.iteration_timestamp - metrics.arrival_time
+        ) * 1000.0
+
+        logger.warning(
+            "[ReqTimeline] request=%s external_request=%s "
+            "arrival=%.6f queued=%.6f scheduled=%.6f first_token=%.6f "
+            "last_token=%.6f ttft_ms=%.3f queue_ms=%.3f "
+            "scheduled_to_first_ms=%.3f decode_ms=%.3f e2e_ms=%.3f "
+            "input_tokens=%d output_tokens=%d",
+            req_state.request_id,
+            req_state.external_req_id,
+            metrics.arrival_time,
+            metrics.queued_ts,
+            metrics.scheduled_ts,
+            metrics.first_token_ts,
+            metrics.last_token_ts,
+            metrics.first_token_latency * 1000.0,
+            queue_ms,
+            scheduled_to_first_ms,
+            decode_ms,
+            e2e_ms,
+            req_state.prompt_len,
+            metrics.num_generation_tokens,
         )
