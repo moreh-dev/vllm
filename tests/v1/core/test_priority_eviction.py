@@ -54,3 +54,27 @@ class TestPriorityEvictionQueue:
         # No _set_meta call — sidecar entry absent.
         assert queue.try_insert(block) is False
         assert queue.num_blocks == 0
+
+    def test_eviction_order_by_priority(self):
+        queue = PriorityEvictionQueue()
+        blocks = [_make_block(i) for i in range(3)]
+        # Insert in non-ascending order to verify the heap reorders.
+        for blk, p in zip(blocks, [80, 20, 50]):
+            _set_meta(queue, blk, priority=p)
+            queue.try_insert(blk)
+        # Lowest priority must come out first.
+        assert queue.pop_lowest() is blocks[1]  # priority 20
+        assert queue.pop_lowest() is blocks[2]  # priority 50
+        assert queue.pop_lowest() is blocks[0]  # priority 80
+
+    def test_eviction_order_tiebreak_by_time(self):
+        queue = PriorityEvictionQueue()
+        blocks = [_make_block(i) for i in range(3)]
+        # Same priority; differ only in last_freed_time.
+        for blk, t in zip(blocks, [300.0, 100.0, 200.0]):
+            _set_meta(queue, blk, priority=50, last_freed=t)
+            queue.try_insert(blk)
+        # Oldest-freed evicted first.
+        assert queue.pop_lowest() is blocks[1]  # t=100
+        assert queue.pop_lowest() is blocks[2]  # t=200
+        assert queue.pop_lowest() is blocks[0]  # t=300
