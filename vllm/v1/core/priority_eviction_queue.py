@@ -28,6 +28,9 @@ class PriorityEvictionQueue:
     def num_blocks(self) -> int:
         return len(self._in_queue)
 
+    def __contains__(self, block: KVCacheBlock) -> bool:
+        return block.block_id in self._in_queue
+
     def try_insert(self, block: KVCacheBlock) -> bool:
         """If the block has a sidecar entry, insert into the heap and
         return True. Otherwise return False (caller routes elsewhere)."""
@@ -67,6 +70,18 @@ class PriorityEvictionQueue:
             self._meta.pop(block_id, None)
             return block
         return None
+
+    def clear_priority(self, block_id: int) -> None:
+        """Drop the sidecar entry for a block (called when its hash is
+        reset or it is permanently evicted from prefix cache)."""
+        self._meta.pop(block_id, None)
+        self._in_queue.discard(block_id)
+
+    def clear(self) -> None:
+        """Drop all sidecar entries and heap state."""
+        self._meta.clear()
+        self._heap.clear()
+        self._in_queue.clear()
 
     def apply_directives(
         self,

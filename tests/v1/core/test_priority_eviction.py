@@ -281,3 +281,59 @@ class TestApplyDirectives:
             block_size=16,
         )
         assert self._peek_meta(queue, 0) is not None
+
+
+class TestSidecarLifecycle:
+    def test_sidecar_entry_cleared_on_pop_lowest(self):
+        queue = PriorityEvictionQueue()
+        block = _make_block(0)
+        _set_meta(queue, block, priority=50)
+        queue.try_insert(block)
+        queue.pop_lowest()
+        assert 0 not in queue._meta
+
+    def test_sidecar_entry_cleared_on_clear_priority(self):
+        queue = PriorityEvictionQueue()
+        block = _make_block(0)
+        _set_meta(queue, block, priority=50)
+        queue.try_insert(block)
+        queue.clear_priority(0)
+        assert 0 not in queue._meta
+        assert 0 not in queue._in_queue
+
+    def test_sidecar_persists_through_reuse_cycle(self):
+        queue = PriorityEvictionQueue()
+        block = _make_block(0)
+        _set_meta(queue, block, priority=50)
+        queue.try_insert(block)
+        queue.remove(block)  # block reused via touch
+        # Sidecar entry is preserved so try_insert succeeds again on next free.
+        assert queue.try_insert(block) is True
+        # And the heap entry reflects the same priority.
+        popped = queue.pop_lowest()
+        assert popped is block
+
+    def test_sidecar_cleared_on_clear_all(self):
+        queue = PriorityEvictionQueue()
+        for i in range(3):
+            block = _make_block(i)
+            _set_meta(queue, block, priority=50)
+            queue.try_insert(block)
+        queue.clear()
+        assert len(queue._meta) == 0
+        assert len(queue._in_queue) == 0
+        assert queue.num_blocks == 0
+
+    def test_clear_priority_for_unknown_block_is_noop(self):
+        queue = PriorityEvictionQueue()
+        queue.clear_priority(999)  # not present — must not raise
+
+    def test_contains_reflects_heap_membership(self):
+        queue = PriorityEvictionQueue()
+        block = _make_block(0)
+        _set_meta(queue, block, priority=50)
+        assert block not in queue
+        queue.try_insert(block)
+        assert block in queue
+        queue.remove(block)
+        assert block not in queue
