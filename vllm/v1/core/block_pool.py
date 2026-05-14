@@ -443,10 +443,13 @@ class BlockPool:
             blocks: A list of blocks to touch.
         """
         for block in blocks:
-            # ref_cnt=0 means this block is in the free list (i.e. eviction
-            # candidate), so remove it.
+            # ref_cnt=0 means this block is in a free queue (LRU or
+            # priority); remove it from whichever queue it sits in.
             if block.ref_cnt == 0 and not block.is_null:
-                self.free_block_queue.remove(block)
+                if block in self.priority_eviction_queue:
+                    self.priority_eviction_queue.remove(block)
+                else:
+                    self.free_block_queue.remove(block)
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)

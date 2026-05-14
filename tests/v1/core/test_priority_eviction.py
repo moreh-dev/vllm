@@ -445,3 +445,27 @@ class TestBlockPoolPriorityEviction:
         # point — but the LRU count remains the same; the priority count
         # adds.
         assert pool.get_num_free_blocks() == free_before + 1
+
+    def test_touch_removes_from_priority_queue(self):
+        pool = self._make_pool()
+        block = pool.blocks[1]
+        block.ref_cnt = 0  # free state
+        # Remove from LRU first so the block lives in exactly one queue,
+        # consistent with the Task-13 invariant.
+        pool.free_block_queue.remove(block)
+        _set_meta(pool.priority_eviction_queue, block, priority=50)
+        pool.priority_eviction_queue.try_insert(block)
+        assert pool.priority_eviction_queue.num_blocks == 1
+        pool.touch([block])
+        # touch() reuses the block: it must leave the priority queue.
+        assert pool.priority_eviction_queue.num_blocks == 0
+        assert block.ref_cnt == 1
+
+    def test_touch_removes_from_lru(self):
+        pool = self._make_pool()
+        # Use a block already in LRU (not prioritized).
+        block = pool.blocks[2]
+        block.ref_cnt = 0
+        # Block is in free_block_queue by default after init.
+        pool.touch([block])
+        assert block.ref_cnt == 1
