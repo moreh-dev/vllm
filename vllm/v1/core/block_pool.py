@@ -363,7 +363,23 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        # Fast path: no prioritized blocks → pure LRU (zero overhead).
+        ret: list[KVCacheBlock]
+        if self.priority_eviction_queue.num_blocks == 0:
+            ret = self.free_block_queue.popleft_n(num_blocks)
+        else:
+            # Drain unprioritized blocks from the LRU free list first, then
+            # take lowest-priority blocks from the priority queue.
+            num_from_free = min(num_blocks, self.free_block_queue.num_free_blocks)
+            ret = (
+                self.free_block_queue.popleft_n(num_from_free) if num_from_free else []
+            )
+            while len(ret) < num_blocks:
+                evicted = self.priority_eviction_queue.pop_lowest()
+                assert evicted is not None, (
+                    "Priority queue empty but more blocks required"
+                )
+                ret.append(evicted)
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -479,7 +495,7 @@ class BlockPool:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
-        num_used_blocks = self.num_gpu_blocks - self.get_num_free_blocks()
+        num_used_blocks = self.num_gpu_blocks - self.free_block_queue.num_free_blocks
         if num_used_blocks != 1:  # The null block is always marked as used
             logger.warning(
                 "Failed to reset prefix cache because some "
@@ -510,9 +526,12 @@ class BlockPool:
         """Get the number of free blocks in the pool.
 
         Returns:
-            The number of free blocks.
+            The number of free blocks (LRU + prioritized).
         """
-        return self.free_block_queue.num_free_blocks
+        return (
+            self.free_block_queue.num_free_blocks
+            + self.priority_eviction_queue.num_blocks
+        )
 
     def get_usage(self) -> float:
         """Get the KV cache usage.

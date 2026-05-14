@@ -410,3 +410,35 @@ class TestBlockPoolPriorityEviction:
         pool._apply_retention_hook(request, blocks, num_full_blocks=1, block_size=16)
         assert pool.priority_eviction_queue.num_blocks == 0
         assert blocks[0].block_id not in pool.priority_eviction_queue._meta
+
+    def test_eviction_drains_lru_before_priority(self):
+        pool = self._make_pool(num_blocks=8, block_size=16)
+        # Mark 3 blocks as prioritized, remove them from LRU first so they
+        # live exclusively in the priority queue (avoids double-allocation
+        # before Task 13 integrates the free-path).
+        prioritized_ids = [1, 2, 3]
+        for bid in prioritized_ids:
+            block = pool.blocks[bid]
+            pool.free_block_queue.remove(block)
+            _set_meta(pool.priority_eviction_queue, block, priority=50)
+            pool.priority_eviction_queue.try_insert(block)
+        # After removal from LRU, count the remaining LRU-only free blocks.
+        free_lru_before = pool.free_block_queue.num_free_blocks
+        # Allocate up to free_lru_before + 1 blocks — the +1 must come from
+        # the priority queue.
+        ret = pool.get_new_blocks(free_lru_before + 1)
+        assert len(ret) == free_lru_before + 1
+        # The last block returned should be the one we marked prioritized
+        # (since the LRU drained first).
+        assert ret[-1].block_id in prioritized_ids
+
+    def test_get_num_free_blocks_sums_both(self):
+        pool = self._make_pool(num_blocks=8)
+        free_before = pool.get_num_free_blocks()
+        block = pool.blocks[1]
+        _set_meta(pool.priority_eviction_queue, block, priority=50)
+        pool.priority_eviction_queue.try_insert(block)
+        # The block is "in" both the LRU and the priority queue at this
+        # point — but the LRU count remains the same; the priority count
+        # adds.
+        assert pool.get_num_free_blocks() == free_before + 1
