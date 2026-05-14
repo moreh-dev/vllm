@@ -357,8 +357,11 @@ class TestBlockPoolPriorityEviction:
 
     def test_reset_prefix_cache_clears_priority_queue(self):
         pool = self._make_pool()
-        # Seed the queue with one prioritized free block.
+        # Seed the queue with one prioritized free block. Remove from the
+        # LRU first so the block lives in exactly one queue, matching the
+        # invariant that free_blocks (Task 13) will enforce.
         block = pool.blocks[1]
+        pool.free_block_queue.remove(block)
         _set_meta(pool.priority_eviction_queue, block, priority=50)
         pool.priority_eviction_queue.try_insert(block)
         assert pool.priority_eviction_queue.num_blocks == 1
