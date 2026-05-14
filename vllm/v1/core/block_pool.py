@@ -26,6 +26,7 @@ from vllm.v1.core.kv_cache_utils import (
     make_block_hash_with_group_id,
     maybe_convert_block_hash,
 )
+from vllm.v1.core.priority_eviction_queue import PriorityEvictionQueue
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -180,6 +181,10 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+
+        # Sidecar storage for priority-based KV-cache eviction. No-op fast
+        # path when num_blocks == 0 (no directives have been applied).
+        self.priority_eviction_queue = PriorityEvictionQueue()
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -460,6 +465,7 @@ class BlockPool:
 
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
+        self.priority_eviction_queue.clear()
 
         # Remove all hashes from all blocks.
         for block in self.blocks:

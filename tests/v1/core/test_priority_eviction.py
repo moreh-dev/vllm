@@ -337,3 +337,30 @@ class TestSidecarLifecycle:
         assert block in queue
         queue.remove(block)
         assert block not in queue
+
+
+class TestBlockPoolPriorityEviction:
+    def _make_pool(self, num_blocks=8, block_size=16):
+        from vllm.v1.core.block_pool import BlockPool
+
+        return BlockPool(
+            num_gpu_blocks=num_blocks,
+            enable_caching=True,
+            hash_block_size=block_size,
+            enable_kv_cache_events=False,
+        )
+
+    def test_pool_has_priority_eviction_queue(self):
+        pool = self._make_pool()
+        assert isinstance(pool.priority_eviction_queue, PriorityEvictionQueue)
+        assert pool.priority_eviction_queue.num_blocks == 0
+
+    def test_reset_prefix_cache_clears_priority_queue(self):
+        pool = self._make_pool()
+        # Seed the queue with one prioritized free block.
+        block = pool.blocks[1]
+        _set_meta(pool.priority_eviction_queue, block, priority=50)
+        pool.priority_eviction_queue.try_insert(block)
+        assert pool.priority_eviction_queue.num_blocks == 1
+        pool.reset_prefix_cache()
+        assert pool.priority_eviction_queue.num_blocks == 0
