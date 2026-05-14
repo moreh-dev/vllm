@@ -3,6 +3,7 @@
 """Priority-based eviction queue with sidecar storage of per-block
 retention metadata."""
 
+import heapq
 from dataclasses import dataclass
 
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -26,8 +27,29 @@ class PriorityEvictionQueue:
     def num_blocks(self) -> int:
         return len(self._in_queue)
 
+    def try_insert(self, block: KVCacheBlock) -> bool:
+        """If the block has a sidecar entry, insert into the heap and
+        return True. Otherwise return False (caller routes elsewhere)."""
+        meta = self._meta.get(block.block_id)
+        if meta is None:
+            return False
+        heapq.heappush(
+            self._heap,
+            (meta.priority, meta.last_freed_time, block.block_id, block),
+        )
+        self._in_queue.add(block.block_id)
+        return True
+
     def pop_lowest(self) -> KVCacheBlock | None:
-        if not self._in_queue:
-            return None
-        # Implementation deferred to Task 3
-        raise NotImplementedError
+        """Pop the lowest-priority block from the heap. Stale entries
+        (block_id no longer in _in_queue) are skipped. Returns None when
+        the queue is empty."""
+        while self._heap:
+            _, _, block_id, block = heapq.heappop(self._heap)
+            if block_id in self._in_queue:
+                self._in_queue.discard(block_id)
+                # Consuming the block discards its sidecar entry: priority
+                # is one-shot per free-evict cycle.
+                self._meta.pop(block_id, None)
+                return block
+        return None

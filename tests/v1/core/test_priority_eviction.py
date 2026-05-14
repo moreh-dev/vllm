@@ -37,3 +37,20 @@ class TestPriorityEvictionQueue:
         queue = PriorityEvictionQueue()
         assert queue.num_blocks == 0
         assert queue.pop_lowest() is None
+
+    def test_insert_and_pop_single(self):
+        queue = PriorityEvictionQueue()
+        block = _make_block(1)
+        _set_meta(queue, block, priority=50)
+        assert queue.try_insert(block) is True
+        assert queue.num_blocks == 1
+        popped = queue.pop_lowest()
+        assert popped is block
+        assert queue.num_blocks == 0
+
+    def test_try_insert_returns_false_for_unprioritized_block(self):
+        queue = PriorityEvictionQueue()
+        block = _make_block(1)
+        # No _set_meta call — sidecar entry absent.
+        assert queue.try_insert(block) is False
+        assert queue.num_blocks == 0
