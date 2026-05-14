@@ -4,6 +4,7 @@
 retention metadata."""
 
 import heapq
+import time
 from dataclasses import dataclass
 
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -48,14 +49,21 @@ class PriorityEvictionQueue:
 
     def pop_lowest(self) -> KVCacheBlock | None:
         """Pop the lowest-priority block from the heap. Stale entries
-        (block_id no longer in _in_queue) are skipped. Returns None when
-        the queue is empty."""
+        (block_id no longer in _in_queue) and expired entries are skipped.
+        Returns None when the queue is empty."""
+        now = time.monotonic()
         while self._heap:
             _, _, block_id, block = heapq.heappop(self._heap)
-            if block_id in self._in_queue:
+            if block_id not in self._in_queue:
+                continue
+            meta = self._meta.get(block_id)
+            if meta is not None and meta.expiry is not None and meta.expiry <= now:
+                # Expired — discard sidecar and skip (caller treats as
+                # unprioritized; will be served by the LRU path).
                 self._in_queue.discard(block_id)
-                # Consuming the block discards its sidecar entry: priority
-                # is one-shot per free-evict cycle.
                 self._meta.pop(block_id, None)
-                return block
+                continue
+            self._in_queue.discard(block_id)
+            self._meta.pop(block_id, None)
+            return block
         return None

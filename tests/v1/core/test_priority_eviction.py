@@ -112,3 +112,32 @@ class TestPriorityEvictionQueue:
         # pop_lowest must skip the stale entry and return block_b.
         assert queue.pop_lowest() is block_b
         assert queue.pop_lowest() is None
+
+    def test_ttl_not_expired(self, monkeypatch):
+        import time as time_mod
+
+        queue = PriorityEvictionQueue()
+        block = _make_block(1)
+        # Set "now" to 100; expiry is at 200 (not yet reached).
+        monkeypatch.setattr(time_mod, "monotonic", lambda: 100.0)
+        _set_meta(queue, block, priority=50, expiry=200.0)
+        queue.try_insert(block)
+        # Even when "now" advances to 150, expiry (200) is in the future.
+        monkeypatch.setattr(time_mod, "monotonic", lambda: 150.0)
+        assert queue.pop_lowest() is block
+
+    def test_ttl_expiry(self, monkeypatch):
+        import time as time_mod
+
+        queue = PriorityEvictionQueue()
+        block = _make_block(1)
+        # Insert with expiry=200.
+        monkeypatch.setattr(time_mod, "monotonic", lambda: 100.0)
+        _set_meta(queue, block, priority=50, expiry=200.0)
+        queue.try_insert(block)
+        # Advance past expiry — block is treated as unprioritized.
+        monkeypatch.setattr(time_mod, "monotonic", lambda: 250.0)
+        # pop_lowest discards expired entries and returns None when none
+        # remain.
+        assert queue.pop_lowest() is None
+        assert queue.num_blocks == 0
