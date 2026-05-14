@@ -40,6 +40,12 @@ class PriorityEvictionQueue:
         self._in_queue.add(block.block_id)
         return True
 
+    def remove(self, block: KVCacheBlock) -> None:
+        """Remove the block from the heap (lazy delete: just drops from
+        _in_queue). The sidecar entry is preserved so that the block's
+        priority survives a reuse cycle and is restored on next free."""
+        self._in_queue.discard(block.block_id)
+
     def pop_lowest(self) -> KVCacheBlock | None:
         """Pop the lowest-priority block from the heap. Stale entries
         (block_id no longer in _in_queue) are skipped. Returns None when

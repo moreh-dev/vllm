@@ -78,3 +78,37 @@ class TestPriorityEvictionQueue:
         assert queue.pop_lowest() is blocks[1]  # t=100
         assert queue.pop_lowest() is blocks[2]  # t=200
         assert queue.pop_lowest() is blocks[0]  # t=300
+
+    def test_remove_keeps_sidecar(self):
+        queue = PriorityEvictionQueue()
+        block = _make_block(1)
+        _set_meta(queue, block, priority=50)
+        queue.try_insert(block)
+        queue.remove(block)
+        assert queue.num_blocks == 0
+        # Sidecar entry survives so that priority returns if the block
+        # is freed again later.
+        assert block.block_id in queue._meta
+        assert queue.try_insert(block) is True
+        assert queue.num_blocks == 1
+
+    def test_remove_nonexistent_is_noop(self):
+        queue = PriorityEvictionQueue()
+        block = _make_block(1)
+        # No insert; remove must not raise.
+        queue.remove(block)
+        assert queue.num_blocks == 0
+
+    def test_stale_heap_entries_are_skipped_in_pop_lowest(self):
+        queue = PriorityEvictionQueue()
+        # Insert two blocks; remove one (leaving a stale heap entry).
+        block_a = _make_block(1)
+        block_b = _make_block(2)
+        _set_meta(queue, block_a, priority=10)
+        _set_meta(queue, block_b, priority=50)
+        queue.try_insert(block_a)
+        queue.try_insert(block_b)
+        queue.remove(block_a)  # block_a now stale in heap
+        # pop_lowest must skip the stale entry and return block_b.
+        assert queue.pop_lowest() is block_b
+        assert queue.pop_lowest() is None
