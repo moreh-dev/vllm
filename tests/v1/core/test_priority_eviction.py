@@ -364,3 +364,49 @@ class TestBlockPoolPriorityEviction:
         assert pool.priority_eviction_queue.num_blocks == 1
         pool.reset_prefix_cache()
         assert pool.priority_eviction_queue.num_blocks == 0
+
+    def test_cache_full_blocks_routes_directives_to_queue(self):
+        from vllm.sampling_params import SamplingParams
+
+        pool = self._make_pool(num_blocks=8, block_size=16)
+        sampling = SamplingParams(
+            extra_args={
+                "retention_directives": [
+                    {"start": 0, "end": 16, "priority": 80},
+                ],
+                "retention_scope": "alice",
+            }
+        )
+
+        # Minimal stub request — only what the hook needs.
+        class _Req:
+            sampling_params: SamplingParams
+
+        request = _Req()
+        request.sampling_params = sampling
+
+        blocks = [pool.blocks[1]]
+        # Drive the hook directly to isolate its behavior from the rest of
+        # cache_full_blocks.
+        pool._apply_retention_hook(request, blocks, num_full_blocks=1, block_size=16)
+
+        meta = pool.priority_eviction_queue._meta.get(blocks[0].block_id)
+        assert meta is not None
+        assert meta.priority == 80
+        assert meta.scope == "alice"
+
+    def test_no_extra_args_zero_overhead_path(self):
+        from vllm.sampling_params import SamplingParams
+
+        pool = self._make_pool()
+        sampling = SamplingParams()  # no extra_args
+
+        class _Req:
+            sampling_params: SamplingParams
+
+        request = _Req()
+        request.sampling_params = sampling
+        blocks = [pool.blocks[1]]
+        pool._apply_retention_hook(request, blocks, num_full_blocks=1, block_size=16)
+        assert pool.priority_eviction_queue.num_blocks == 0
+        assert blocks[0].block_id not in pool.priority_eviction_queue._meta

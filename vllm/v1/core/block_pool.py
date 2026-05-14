@@ -278,6 +278,8 @@ class BlockPool:
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
 
+        self._apply_retention_hook(request, blocks, num_full_blocks, block_size)
+
         if self.enable_kv_cache_events:
             if num_cached_blocks == 0:
                 parent_block_hash: ExternalBlockHash | None = None
@@ -323,6 +325,29 @@ class BlockPool:
                     group_idx=kv_cache_group_id,
                 )
             )
+
+    def _apply_retention_hook(
+        self,
+        request,
+        blocks: list[KVCacheBlock],
+        num_full_blocks: int,
+        block_size: int,
+    ) -> None:
+        """Read retention directives from request.sampling_params.extra_args
+        and apply them to the given full blocks. No-op when neither
+        retention_directives nor retention_scope is present (zero-overhead
+        fast path for non-retention requests)."""
+        extra = getattr(request.sampling_params, "extra_args", None) or {}
+        directives = extra.get("retention_directives")
+        scope = extra.get("retention_scope")
+        if directives is None and scope is None:
+            return
+        self.priority_eviction_queue.apply_directives(
+            blocks[:num_full_blocks],
+            directives or [],
+            scope,
+            block_size,
+        )
 
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
