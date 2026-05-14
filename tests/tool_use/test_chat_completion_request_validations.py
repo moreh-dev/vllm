@@ -61,3 +61,24 @@ def test_chat_completion_request_with_tool_choice_but_no_tools(tool_choice):
                 "tools": None,
             }
         )
+
+
+def test_retention_directives_field_round_trips():
+    from vllm.entrypoints.openai.chat_completion.protocol import (
+        ChatCompletionRequest,
+    )
+
+    req = ChatCompletionRequest(
+        model="dummy",
+        messages=[{"role": "user", "content": "hi"}],
+        retention_directives=[{"start": 0, "end": 16, "priority": 80}],
+        retention_scope="alice",
+    )
+    sp = req.to_sampling_params(
+        max_tokens=16,
+        default_sampling_params={},
+    )
+    assert sp.extra_args["retention_directives"] == [
+        {"start": 0, "end": 16, "priority": 80}
+    ]
+    assert sp.extra_args["retention_scope"] == "alice"
