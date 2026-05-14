@@ -141,3 +141,57 @@ class TestPriorityEvictionQueue:
         # remain.
         assert queue.pop_lowest() is None
         assert queue.num_blocks == 0
+
+
+class TestApplyDirectives:
+    def _peek_meta(self, queue: PriorityEvictionQueue, block_id: int):
+        return queue._meta.get(block_id)
+
+    def test_apply_retention_to_block_single_match(self):
+        queue = PriorityEvictionQueue()
+        block = _make_block(0)  # tokens 0..15 (block_size=16)
+        directives = [{"start": 0, "end": 16, "priority": 50}]
+        queue.apply_directives([block], directives, scope=None, block_size=16)
+        meta = self._peek_meta(queue, 0)
+        assert meta is not None
+        assert meta.priority == 50
+
+    def test_apply_retention_no_match(self):
+        queue = PriorityEvictionQueue()
+        block = _make_block(0)  # tokens 0..15
+        # Directive covers tokens 100..200 — no overlap.
+        directives = [{"start": 100, "end": 200, "priority": 50}]
+        queue.apply_directives([block], directives, scope=None, block_size=16)
+        assert self._peek_meta(queue, 0) is None
+
+    def test_apply_retention_highest_priority_wins(self):
+        queue = PriorityEvictionQueue()
+        block = _make_block(0)  # tokens 0..15
+        directives = [
+            {"start": 0, "end": 16, "priority": 30},
+            {"start": 0, "end": 16, "priority": 80},  # higher wins
+            {"start": 0, "end": 16, "priority": 50},
+        ]
+        queue.apply_directives([block], directives, scope=None, block_size=16)
+        assert self._peek_meta(queue, 0).priority == 80
+
+    def test_apply_retention_open_ended_range(self):
+        queue = PriorityEvictionQueue()
+        blocks = [_make_block(i) for i in range(3)]  # tokens 0..15, 16..31, 32..47
+        # end=None means "from start to end of sequence".
+        directives = [{"start": 16, "end": None, "priority": 70}]
+        queue.apply_directives(blocks, directives, scope=None, block_size=16)
+        assert self._peek_meta(queue, 0) is None  # tokens 0..15 not covered
+        assert self._peek_meta(queue, 1).priority == 70
+        assert self._peek_meta(queue, 2).priority == 70
+
+    def test_apply_retention_with_duration(self, monkeypatch):
+        import time as time_mod
+
+        monkeypatch.setattr(time_mod, "monotonic", lambda: 1000.0)
+        queue = PriorityEvictionQueue()
+        block = _make_block(0)
+        directives = [{"start": 0, "end": 16, "priority": 50, "duration": 60.0}]
+        queue.apply_directives([block], directives, scope=None, block_size=16)
+        meta = self._peek_meta(queue, 0)
+        assert meta.expiry == 1060.0

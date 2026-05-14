@@ -67,3 +67,45 @@ class PriorityEvictionQueue:
             self._meta.pop(block_id, None)
             return block
         return None
+
+    def apply_directives(
+        self,
+        blocks: list[KVCacheBlock],
+        directives: list[dict],
+        scope: str | None,
+        block_size: int,
+    ) -> None:
+        """For each full block, find the highest-priority directive whose
+        token range overlaps the block's range and update the sidecar
+        entry. Blocks with no matching directive are left untouched at
+        this stage (ownership/clear semantics added in Task 7)."""
+        if not directives:
+            return
+        now = time.monotonic()
+        for idx, block in enumerate(blocks):
+            if block.is_null:
+                continue
+            token_start = idx * block_size
+            token_end = token_start + block_size
+            best_priority = -1
+            best_duration: float | None = None
+            for d in directives:
+                d_start = d.get("start", 0)
+                d_end = d.get("end")
+                if d_end is not None and d_end <= token_start:
+                    continue
+                if d_start >= token_end:
+                    continue
+                p = d.get("priority", 0)
+                if p > best_priority:
+                    best_priority = p
+                    best_duration = d.get("duration")
+            if best_priority < 0:
+                continue
+            expiry = now + best_duration if best_duration is not None else None
+            self._meta[block.block_id] = RetentionMeta(
+                priority=best_priority,
+                expiry=expiry,
+                scope=scope,
+                last_freed_time=0.0,
+            )
