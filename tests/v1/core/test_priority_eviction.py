@@ -513,3 +513,46 @@ class TestBlockPoolPriorityEviction:
         # block whose ref_cnt > 0 but had a prior priority).
         pool.evict_blocks({block.block_id})
         assert block.block_id not in pool.priority_eviction_queue._meta
+
+
+class TestStructuralInvariants:
+    """Lock in the spec's 'sidecar pattern' contract:
+    - KVCacheBlock must not gain feature-specific fields for retention.
+    - Request must not gain retention attributes.
+
+    If these tests fail, you are about to break the additive-only feel
+    of this PR. Move the new state into PriorityEvictionQueue's sidecar
+    instead.
+    """
+
+    def test_kv_cache_block_has_no_priority_fields(self):
+        from dataclasses import fields
+
+        from vllm.v1.core.kv_cache_utils import KVCacheBlock
+
+        names = {f.name for f in fields(KVCacheBlock)}
+        forbidden = {
+            "priority",
+            "priority_expiry",
+            "priority_scope",
+            "last_freed_time",
+        }
+        leaks = names & forbidden
+        assert not leaks, (
+            f"KVCacheBlock has retention-specific fields {leaks!r}. "
+            "Move them to PriorityEvictionQueue's sidecar (see "
+            "docs/superpowers/specs/2026-05-14-retention-api-super-minimal-design.md)."
+        )
+
+    def test_request_has_no_retention_attributes(self):
+        import inspect
+
+        from vllm.v1.request import Request
+
+        src = inspect.getsource(Request.__init__)
+        forbidden = ("retention_directives", "retention_scope")
+        leaks = [name for name in forbidden if f"self.{name}" in src]
+        assert not leaks, (
+            f"Request.__init__ assigns to {leaks!r}. Read retention from "
+            "request.sampling_params.extra_args at the use site instead."
+        )
