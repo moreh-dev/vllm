@@ -469,3 +469,38 @@ class TestBlockPoolPriorityEviction:
         # Block is in free_block_queue by default after init.
         pool.touch([block])
         assert block.ref_cnt == 1
+
+    def test_free_unprioritized_goes_to_lru(self):
+        pool = self._make_pool()
+        block = pool.blocks[1]
+        block.ref_cnt = 1
+        # Block must not be in LRU while ref_cnt > 0 — remove it first to
+        # mirror the production state of an active block.
+        pool.free_block_queue.remove(block)
+        free_before = pool.free_block_queue.num_free_blocks
+        pool.free_blocks([block])
+        assert pool.free_block_queue.num_free_blocks == free_before + 1
+        assert pool.priority_eviction_queue.num_blocks == 0
+
+    def test_free_prioritized_goes_to_priority_queue(self, monkeypatch):
+        import time as time_mod
+
+        monkeypatch.setattr(time_mod, "monotonic", lambda: 12345.0)
+        pool = self._make_pool()
+        block = pool.blocks[1]
+        block.ref_cnt = 1
+        # Block must not be in LRU while ref_cnt > 0 — remove it first.
+        pool.free_block_queue.remove(block)
+        # Install a sidecar entry so try_insert recognizes the block as
+        # prioritized.
+        _set_meta(pool.priority_eviction_queue, block, priority=50)
+        free_before = pool.free_block_queue.num_free_blocks
+        pool.free_blocks([block])
+        # Did NOT land in the LRU queue.
+        assert pool.free_block_queue.num_free_blocks == free_before
+        # Did land in the priority queue with updated last_freed_time.
+        assert pool.priority_eviction_queue.num_blocks == 1
+        assert (
+            pool.priority_eviction_queue._meta[block.block_id].last_freed_time
+            == 12345.0
+        )

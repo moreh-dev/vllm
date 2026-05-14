@@ -31,12 +31,23 @@ class PriorityEvictionQueue:
     def __contains__(self, block: KVCacheBlock) -> bool:
         return block.block_id in self._in_queue
 
-    def try_insert(self, block: KVCacheBlock) -> bool:
+    def try_insert(
+        self,
+        block: KVCacheBlock,
+        last_freed_time: float | None = None,
+    ) -> bool:
         """If the block has a sidecar entry, insert into the heap and
-        return True. Otherwise return False (caller routes elsewhere)."""
+        return True. Otherwise return False (caller routes elsewhere).
+
+        last_freed_time, when provided, overrides the value stored in the
+        sidecar entry. This is used by free_blocks() to stamp the current
+        monotonic time on freshly-freed blocks so the heap tiebreak
+        reflects this most-recent free."""
         meta = self._meta.get(block.block_id)
         if meta is None:
             return False
+        if last_freed_time is not None:
+            meta.last_freed_time = last_freed_time
         heapq.heappush(
             self._heap,
             (meta.priority, meta.last_freed_time, block.block_id, block),

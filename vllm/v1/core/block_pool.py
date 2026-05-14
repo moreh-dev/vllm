@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -466,8 +467,17 @@ class BlockPool:
         blocks_list = list(ordered_blocks)
         for block in blocks_list:
             block.ref_cnt -= 1
+        free_able = [b for b in blocks_list if b.ref_cnt == 0 and not b.is_null]
+        # Stamp the current monotonic time so the heap tiebreak reflects
+        # this most-recent free. try_insert returns False for blocks
+        # without a sidecar entry; those fall through to the LRU free list.
+        now = time.monotonic()
         self.free_block_queue.append_n(
-            [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
+            [
+                b
+                for b in free_able
+                if not self.priority_eviction_queue.try_insert(b, last_freed_time=now)
+            ]
         )
 
     def evict_blocks(self, block_ids: set[int]) -> None:
