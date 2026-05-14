@@ -195,3 +195,89 @@ class TestApplyDirectives:
         queue.apply_directives([block], directives, scope=None, block_size=16)
         meta = self._peek_meta(queue, 0)
         assert meta.expiry == 1060.0
+
+    def test_escalation_from_different_scope(self):
+        queue = PriorityEvictionQueue()
+        block = _make_block(0)
+        _set_meta(queue, block, priority=30, scope="alice")
+        # bob escalates to 80 — allowed regardless of scope.
+        queue.apply_directives(
+            [block],
+            [{"start": 0, "end": 16, "priority": 80}],
+            scope="bob",
+            block_size=16,
+        )
+        meta = self._peek_meta(queue, 0)
+        assert meta.priority == 80
+        assert meta.scope == "bob"
+
+    def test_downgrade_blocked_from_different_scope(self):
+        queue = PriorityEvictionQueue()
+        block = _make_block(0)
+        _set_meta(queue, block, priority=80, scope="alice")
+        # bob tries to downgrade to 20 — denied (alice owns the block).
+        queue.apply_directives(
+            [block],
+            [{"start": 0, "end": 16, "priority": 20}],
+            scope="bob",
+            block_size=16,
+        )
+        meta = self._peek_meta(queue, 0)
+        assert meta.priority == 80
+        assert meta.scope == "alice"
+
+    def test_owner_can_downgrade(self):
+        queue = PriorityEvictionQueue()
+        block = _make_block(0)
+        _set_meta(queue, block, priority=80, scope="alice")
+        queue.apply_directives(
+            [block],
+            [{"start": 0, "end": 16, "priority": 20}],
+            scope="alice",
+            block_size=16,
+        )
+        meta = self._peek_meta(queue, 0)
+        assert meta.priority == 20
+        assert meta.scope == "alice"
+
+    def test_owner_clear_on_no_match(self):
+        queue = PriorityEvictionQueue()
+        block = _make_block(0)
+        _set_meta(queue, block, priority=50, scope="alice")
+        # alice issues directives that don't cover this block — sidecar
+        # entry is cleared.
+        queue.apply_directives(
+            [block],
+            [{"start": 100, "end": 200, "priority": 90}],
+            scope="alice",
+            block_size=16,
+        )
+        assert self._peek_meta(queue, 0) is None
+
+    def test_non_owner_no_clear_on_no_match(self):
+        queue = PriorityEvictionQueue()
+        block = _make_block(0)
+        _set_meta(queue, block, priority=50, scope="alice")
+        # bob's directives don't cover this block — alice's entry stays.
+        queue.apply_directives(
+            [block],
+            [{"start": 100, "end": 200, "priority": 90}],
+            scope="bob",
+            block_size=16,
+        )
+        meta = self._peek_meta(queue, 0)
+        assert meta is not None
+        assert meta.scope == "alice"
+
+    def test_no_scope_no_clear(self):
+        queue = PriorityEvictionQueue()
+        block = _make_block(0)
+        _set_meta(queue, block, priority=50, scope="alice")
+        # scope=None caller is anonymous — must not clear anyone's entry.
+        queue.apply_directives(
+            [block],
+            [{"start": 100, "end": 200, "priority": 90}],
+            scope=None,
+            block_size=16,
+        )
+        assert self._peek_meta(queue, 0) is not None

@@ -75,12 +75,16 @@ class PriorityEvictionQueue:
         scope: str | None,
         block_size: int,
     ) -> None:
-        """For each full block, find the highest-priority directive whose
-        token range overlaps the block's range and update the sidecar
-        entry. Blocks with no matching directive are left untouched at
-        this stage (ownership/clear semantics added in Task 7)."""
-        if not directives:
-            return
+        """For each full block, find the highest-priority overlapping
+        directive and update the sidecar entry under these rules:
+
+        - Escalation (new > current priority): any caller may raise priority
+          and takes ownership of the block.
+        - Downgrade or refresh (new <= current priority): only the current
+          owner may do this.
+        - No matching directive: if the caller has scope ownership of this
+          block, the sidecar entry is cleared.
+        """
         now = time.monotonic()
         for idx, block in enumerate(blocks):
             if block.is_null:
@@ -100,12 +104,31 @@ class PriorityEvictionQueue:
                 if p > best_priority:
                     best_priority = p
                     best_duration = d.get("duration")
+
+            current = self._meta.get(block.block_id)
+
             if best_priority < 0:
+                # No matching directive. Owner-initiated clear only.
+                if scope is not None and current is not None and current.scope == scope:
+                    self._meta.pop(block.block_id, None)
                 continue
+
             expiry = now + best_duration if best_duration is not None else None
-            self._meta[block.block_id] = RetentionMeta(
-                priority=best_priority,
-                expiry=expiry,
-                scope=scope,
-                last_freed_time=0.0,
-            )
+            current_priority = current.priority if current is not None else -1
+            if best_priority > current_priority:
+                # Escalation: any caller may raise priority and takes ownership.
+                self._meta[block.block_id] = RetentionMeta(
+                    priority=best_priority,
+                    expiry=expiry,
+                    scope=scope,
+                    last_freed_time=current.last_freed_time if current else 0.0,
+                )
+            elif current is not None and scope is not None and current.scope == scope:
+                # Same scope: owner may downgrade or refresh.
+                self._meta[block.block_id] = RetentionMeta(
+                    priority=best_priority,
+                    expiry=expiry,
+                    scope=scope,
+                    last_freed_time=current.last_freed_time,
+                )
+            # Non-owner downgrade: silently ignored.
