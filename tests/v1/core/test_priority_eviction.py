@@ -504,3 +504,12 @@ class TestBlockPoolPriorityEviction:
             pool.priority_eviction_queue._meta[block.block_id].last_freed_time
             == 12345.0
         )
+
+    def test_evict_blocks_clears_sidecar(self):
+        pool = self._make_pool()
+        block = pool.blocks[1]
+        _set_meta(pool.priority_eviction_queue, block, priority=50)
+        # Don't insert into heap — just install sidecar (simulating a
+        # block whose ref_cnt > 0 but had a prior priority).
+        pool.evict_blocks({block.block_id})
+        assert block.block_id not in pool.priority_eviction_queue._meta

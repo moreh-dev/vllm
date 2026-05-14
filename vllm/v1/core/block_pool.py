@@ -498,6 +498,7 @@ class BlockPool:
             )
             block = self.blocks[block_id]
             self._maybe_evict_cached_block(block)
+            self.priority_eviction_queue.clear_priority(block_id)
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
