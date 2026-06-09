@@ -55,6 +55,46 @@ class TestPriorityEvictionQueue:
         assert queue.try_insert(block) is False
         assert queue.num_blocks == 0
 
+    def test_try_insert_below_threshold_drops_sidecar_routes_to_lru(self, monkeypatch):
+        """A sidecar entry whose priority is below the configured
+        threshold must be rejected: try_insert returns False and the
+        sidecar is dropped so the caller (free_blocks) routes the block
+        to the LRU free list. The threshold guarantees enough cached
+        blocks stay in LRU to absorb get_new_blocks demand without
+        draining the priority queue."""
+        import vllm.v1.core.priority_eviction_queue as pq_mod
+
+        monkeypatch.setattr(pq_mod, "_PRIORITY_THRESHOLD", 60)
+        queue = PriorityEvictionQueue()
+        block = _make_block(1)
+        _set_meta(queue, block, priority=50)
+
+        assert queue.try_insert(block) is False, (
+            "priority below threshold must be rejected so the block "
+            "goes to LRU; the threshold is the whole point of Fix 4.0."
+        )
+        assert queue.num_blocks == 0
+        assert block.block_id not in queue._meta, (
+            "rejected entry must drop its sidecar so a later "
+            "apply_directives starts from a clean slate."
+        )
+
+    def test_try_insert_at_or_above_threshold_enters_queue(self, monkeypatch):
+        """At-or-above the threshold the regular insertion path runs:
+        sidecar stays, the block lands in _in_queue, num_blocks goes up."""
+        import vllm.v1.core.priority_eviction_queue as pq_mod
+
+        monkeypatch.setattr(pq_mod, "_PRIORITY_THRESHOLD", 60)
+        queue = PriorityEvictionQueue()
+        block = _make_block(1)
+        _set_meta(queue, block, priority=70)
+
+        assert queue.try_insert(block) is True, (
+            "priority at/above threshold must enter the queue normally."
+        )
+        assert queue.num_blocks == 1
+        assert block.block_id in queue._meta
+
     def test_eviction_order_by_priority(self):
         queue = PriorityEvictionQueue()
         blocks = [_make_block(i) for i in range(3)]
@@ -113,6 +153,57 @@ class TestPriorityEvictionQueue:
         assert queue.pop_lowest() is block_b
         assert queue.pop_lowest() is None
 
+    def test_reinsert_after_remove_orders_by_current_priority(self):
+        """Regression (priority inversion): a block removed (touch/reuse) and
+        re-inserted with an ESCALATED priority must be ordered by the current
+        priority, not the stale heap tuple left behind by the lazy remove().
+
+        Sequence: A enters at 50 -> remove() (lazy delete leaves a (50,A)
+        tuple in the heap) -> A escalated to 90 -> re-inserted (pushes a
+        (90,A) tuple; both A tuples now satisfy the block_id-in-_in_queue
+        test). A live priority-70 block B must evict BEFORE A. The buggy
+        code pops the stale (50,A) tuple first and evicts the
+        escalated-to-90 block ahead of the 70 block."""
+        queue = PriorityEvictionQueue()
+        a = _make_block(1)
+        b = _make_block(2)
+        _set_meta(queue, a, priority=50)
+        queue.try_insert(a)
+        queue.remove(a)  # touch: lazy delete, stale (50,A) tuple stays
+        _set_meta(queue, a, priority=90)  # escalation via apply_directives
+        queue.try_insert(a)  # re-freed: pushes (90,A); (50,A) still in heap
+        _set_meta(queue, b, priority=70)
+        queue.try_insert(b)
+        assert queue.pop_lowest() is b, (
+            "priority-70 block must evict before the escalated-to-90 block; "
+            "a stale heap tuple must not order eviction by the old priority."
+        )
+        assert queue.pop_lowest() is a
+        assert queue.pop_lowest() is None
+
+    def test_reinsert_after_remove_orders_by_current_time(self):
+        """Regression (recency tiebreak): same priority, but a block removed
+        and re-freed with a NEWER last_freed_time must be ordered by the new
+        time. The stale tuple carries the OLD (smaller) time and would
+        otherwise make the block look older-freed than it is, evicting it
+        before a genuinely older block."""
+        queue = PriorityEvictionQueue()
+        a = _make_block(1)
+        b = _make_block(2)
+        _set_meta(queue, a, priority=50, last_freed=100.0)
+        queue.try_insert(a, last_freed_time=100.0)
+        queue.remove(a)  # stale (t=100,A) left in heap
+        queue.try_insert(a, last_freed_time=300.0)  # re-freed later; A now newest
+        _set_meta(queue, b, priority=50, last_freed=200.0)
+        queue.try_insert(b, last_freed_time=200.0)
+        # A was last freed at 300 (newer than B's 200) -> B evicts first.
+        assert queue.pop_lowest() is b, (
+            "block re-freed at t=300 must evict after the t=200 block; "
+            "a stale t=100 tuple must not defeat the recency tiebreak."
+        )
+        assert queue.pop_lowest() is a
+        assert queue.pop_lowest() is None
+
     def test_ttl_not_expired(self, monkeypatch):
         import time as time_mod
 
@@ -126,7 +217,14 @@ class TestPriorityEvictionQueue:
         monkeypatch.setattr(time_mod, "monotonic", lambda: 150.0)
         assert queue.pop_lowest() is block
 
-    def test_ttl_expiry(self, monkeypatch):
+    def test_drain_expired_then_pop_lowest_workflow(self, monkeypatch):
+        """The full eviction workflow with TTL: drain_expired first
+        removes expired entries from the queue (caller demotes them to
+        LRU). pop_lowest then sees only live entries.
+
+        Expired entries no longer leak into pop_lowest — that was the
+        limbo-fix-era band-aid and is superseded by drain_expired.
+        """
         import time as time_mod
 
         queue = PriorityEvictionQueue()
@@ -135,11 +233,74 @@ class TestPriorityEvictionQueue:
         monkeypatch.setattr(time_mod, "monotonic", lambda: 100.0)
         _set_meta(queue, block, priority=50, expiry=200.0)
         queue.try_insert(block)
-        # Advance past expiry — block is treated as unprioritized.
+
+        # Advance past expiry.
         monkeypatch.setattr(time_mod, "monotonic", lambda: 250.0)
-        # pop_lowest discards expired entries and returns None when none
-        # remain.
+
+        # New semantic: drain_expired returns the block_id, queue is
+        # empty afterwards. The caller (BlockPool.get_new_blocks) is
+        # responsible for routing the corresponding block into the LRU.
+        drained = queue.drain_expired()
+        assert drained == [block.block_id]
+        assert queue.num_blocks == 0
+        # pop_lowest now sees an empty queue.
         assert queue.pop_lowest() is None
+
+    def test_drain_expired_returns_only_expired_block_ids(self, monkeypatch):
+        """drain_expired returns block_ids whose sidecar.expiry has passed,
+        and removes those entries from _in_queue + _meta. Non-expired
+        entries stay in the queue."""
+        import time as time_mod
+
+        queue = PriorityEvictionQueue()
+        b_exp = _make_block(1)
+        b_live = _make_block(2)
+        b_no_exp = _make_block(3)
+
+        monkeypatch.setattr(time_mod, "monotonic", lambda: 100.0)
+        _set_meta(queue, b_exp, priority=50, expiry=150.0)  # will expire
+        _set_meta(queue, b_live, priority=70, expiry=250.0)  # still alive
+        _set_meta(queue, b_no_exp, priority=90, expiry=None)  # no TTL
+        queue.try_insert(b_exp)
+        queue.try_insert(b_live)
+        queue.try_insert(b_no_exp)
+
+        # Advance time past b_exp's expiry only.
+        monkeypatch.setattr(time_mod, "monotonic", lambda: 200.0)
+        drained = queue.drain_expired()
+
+        assert drained == [b_exp.block_id]
+        assert b_exp.block_id not in queue._in_queue
+        assert b_exp.block_id not in queue._meta
+        assert b_live.block_id in queue._in_queue
+        assert b_no_exp.block_id in queue._in_queue
+        assert queue.num_blocks == 2
+
+    def test_drain_expired_empty_queue_is_noop(self):
+        """drain_expired on an empty queue returns an empty list."""
+        queue = PriorityEvictionQueue()
+        assert queue.drain_expired() == []
+        assert queue.num_blocks == 0
+
+    def test_try_insert_expired_meta_routes_to_lru(self, monkeypatch):
+        """try_insert must return False when the sidecar entry is already
+        expired so the caller (free_blocks) routes the block to the LRU
+        free list instead of the priority queue. Otherwise the block would
+        live in the priority queue forever, or land in limbo on the next
+        pop_lowest."""
+        import time as time_mod
+
+        queue = PriorityEvictionQueue()
+        block = _make_block(1)
+        monkeypatch.setattr(time_mod, "monotonic", lambda: 100.0)
+        _set_meta(queue, block, priority=50, expiry=150.0)
+        # Advance past expiry BEFORE try_insert.
+        monkeypatch.setattr(time_mod, "monotonic", lambda: 200.0)
+        assert queue.try_insert(block, last_freed_time=200.0) is False
+        # The expired sidecar must be cleaned up — otherwise a later
+        # apply_directives could re-prime the same block back into the
+        # priority queue.
+        assert block.block_id not in queue._meta
         assert queue.num_blocks == 0
 
 
@@ -505,6 +666,86 @@ class TestBlockPoolPriorityEviction:
             == 12345.0
         )
 
+    def test_touch_on_limbo_block_does_not_raise(self):
+        """A block in neither the priority queue nor the LRU free list
+        must not crash touch(). This guards against the pre-fix scenario
+        where pop_lowest silently dropped an expired entry, leaving the
+        block in limbo and crashing the next prefix-cache hit."""
+        pool = self._make_pool()
+        block = pool.blocks[1]
+        # Take it out of LRU by hand to simulate the post-pop_lowest
+        # limbo: ref_cnt=0, not in priority queue, not in free list.
+        pool.free_block_queue.remove(block)
+        assert block.prev_free_block is None
+        assert block.next_free_block is None
+        assert block not in pool.priority_eviction_queue
+        assert block.ref_cnt == 0
+        # touch() must not raise.
+        pool.touch([block])
+        assert block.ref_cnt == 1
+
+    def test_get_new_blocks_drains_all_expired_to_lru(self, monkeypatch):
+        """drain_expired must move ALL expired entries to the LRU, not
+        just enough to satisfy the current allocation. Otherwise the
+        next get_new_blocks call would re-fire the cache-eviction storm
+        on the entries left behind in the priority queue.
+
+        Pre-fix behavior: get_new_blocks(1) pops 1 entry from the
+        priority queue via pop_lowest, leaves the other 2 expired
+        entries in the queue. Each subsequent get_new_blocks would
+        evict another cached block from the map.
+
+        Post-fix behavior: drain_expired moves all 3 expired blocks to
+        the LRU tail BEFORE any pop happens. get_new_blocks(1) then
+        pops 1 from the LRU and the other 2 expired blocks sit in the
+        LRU with their cached hashes intact until normal LRU order
+        reaches them.
+        """
+        import time as time_mod
+
+        pool = self._make_pool()
+
+        # Stash 3 blocks into the priority queue with expiring sidecars.
+        monkeypatch.setattr(time_mod, "monotonic", lambda: 100.0)
+        target_ids = []
+        for bid in (1, 2, 3):
+            block = pool.blocks[bid]
+            pool.free_block_queue.remove(block)  # take out of LRU
+            _set_meta(
+                pool.priority_eviction_queue,
+                block,
+                priority=50,
+                expiry=150.0,
+                last_freed=100.0,
+            )
+            pool.priority_eviction_queue.try_insert(block, last_freed_time=100.0)
+            target_ids.append(bid)
+        assert pool.priority_eviction_queue.num_blocks == 3
+        lru_before = pool.free_block_queue.num_free_blocks
+
+        # Advance past expiry, then ask for ONE block.
+        monkeypatch.setattr(time_mod, "monotonic", lambda: 200.0)
+        allocated = pool.get_new_blocks(1)
+        assert len(allocated) == 1
+
+        # Post-fix invariant: the priority queue is fully drained (0
+        # entries), AND the LRU has gained 2 entries (we drained 3 and
+        # consumed 1).
+        # Pre-fix would leave 2 entries in the priority queue and the
+        # LRU would have lost 0 entries net (started empty for our 3
+        # blocks, ended empty too).
+        assert pool.priority_eviction_queue.num_blocks == 0, (
+            f"priority queue should be drained, has "
+            f"{pool.priority_eviction_queue.num_blocks} entries"
+        )
+        assert pool.free_block_queue.num_free_blocks == lru_before + 2, (
+            f"LRU should have gained 2 demoted-from-priority entries; "
+            f"got {pool.free_block_queue.num_free_blocks - lru_before} delta"
+        )
+        # Sidecars also cleaned up for all 3.
+        for bid in target_ids:
+            assert bid not in pool.priority_eviction_queue._meta
+
     def test_evict_blocks_clears_sidecar(self):
         pool = self._make_pool()
         block = pool.blocks[1]
@@ -513,6 +754,249 @@ class TestBlockPoolPriorityEviction:
         # block whose ref_cnt > 0 but had a prior priority).
         pool.evict_blocks({block.block_id})
         assert block.block_id not in pool.priority_eviction_queue._meta
+
+    def test_priority_queue_pop_preserves_cache_map(self, monkeypatch):
+        """A block popped from the priority queue keeps its hash in the
+        cache map. Today the storm: every priority-queue pop wipes the
+        cache hash; under the fix, only LRU-popleft does. This is the
+        unit-level guard for the 1B cache-eviction-storm regression.
+        """
+        import time as time_mod
+
+        from vllm.v1.core.kv_cache_utils import (
+            BlockHash,
+            make_block_hash_with_group_id,
+        )
+
+        pool = self._make_pool()
+        block = pool.blocks[1]
+        # Promote to in-use + cached, then free into the priority queue.
+        pool.free_block_queue.remove(block)
+        block.ref_cnt = 1
+        raw_hash = BlockHash((42).to_bytes(32, "little"))
+        h = make_block_hash_with_group_id(raw_hash, 0)
+        block.block_hash = h
+        pool.cached_block_hash_to_block.insert(h, block)
+
+        monkeypatch.setattr(time_mod, "monotonic", lambda: 100.0)
+        _set_meta(
+            pool.priority_eviction_queue,
+            block,
+            priority=50,
+            expiry=None,
+            last_freed=100.0,
+        )
+        pool.free_blocks([block])
+        assert block in pool.priority_eviction_queue
+        assert pool.get_cached_block(raw_hash, [0]) is not None
+
+        # Drain the LRU so the next get_new_blocks must dip into the
+        # priority queue.
+        for b in list(pool.free_block_queue.get_all_free_blocks()):
+            if b is not block and b is not pool.null_block:
+                pool.free_block_queue.remove(b)
+                b.ref_cnt = 1
+        assert pool.free_block_queue.num_free_blocks == 0
+        assert pool.priority_eviction_queue.num_blocks == 1
+
+        # Now pop via get_new_blocks. The block must come back with its
+        # hash intact and the cache map entry preserved.
+        allocated = pool.get_new_blocks(1)
+        assert len(allocated) == 1
+        assert allocated[0] is block
+        assert block.ref_cnt == 1
+        # The fix's guarantee:
+        assert block.block_hash == h, (
+            "Block hash was reset on priority-queue pop; the fix should "
+            "have left it intact."
+        )
+        cached = pool.get_cached_block(raw_hash, [0])
+        assert cached is not None and cached[0] is block, (
+            "cached_block_hash_to_block entry was evicted on "
+            "priority-queue pop; the fix should preserve it for "
+            "subsequent prefix hits."
+        )
+
+    def test_lru_popleft_still_clears_cache_map(self):
+        """LRU eviction's semantics are unchanged: popleft on a cached
+        block must clear the cache map entry and reset the hash. Guards
+        against accidentally decoupling the LRU path along with the
+        priority-queue path."""
+        from vllm.v1.core.kv_cache_utils import (
+            BlockHash,
+            make_block_hash_with_group_id,
+        )
+
+        pool = self._make_pool()
+        block = pool.blocks[1]
+        # Cache the block but leave it in LRU (no retention meta).
+        pool.free_block_queue.remove(block)
+        block.ref_cnt = 1
+        raw_hash = BlockHash((77).to_bytes(32, "little"))
+        h = make_block_hash_with_group_id(raw_hash, 0)
+        block.block_hash = h
+        pool.cached_block_hash_to_block.insert(h, block)
+        pool.free_blocks([block])
+        # Block is now in LRU with cache map entry intact.
+        assert block not in pool.priority_eviction_queue
+        cached = pool.get_cached_block(raw_hash, [0])
+        assert cached is not None and cached[0] is block
+
+        # Force LRU drain: ask for everything in LRU.
+        n_free = pool.free_block_queue.num_free_blocks
+        pool.get_new_blocks(n_free)
+
+        # LRU semantics: cache map entry is gone, hash is cleared.
+        assert pool.get_cached_block(raw_hash, [0]) is None, (
+            "LRU popleft must still clear cached_block_hash_to_block; "
+            "the fix targets PQ pop only."
+        )
+        assert block.block_hash is None, (
+            "LRU popleft must still reset block.block_hash; the fix "
+            "targets PQ pop only."
+        )
+
+    def test_cache_full_blocks_lazy_cleanup(self, monkeypatch):
+        """A block popped from the priority queue carries its old hash.
+        When cache_full_blocks runs on it again with a new hash, the
+        old hash must be lazily removed from the cache map before the
+        new hash is registered. This is the integration test that pairs
+        with the priority-queue-preserves-cache-map test.
+
+        Drives `cache_full_blocks` end-to-end (not the helper sequence)
+        so that removing the lazy-cleanup branch in block_pool.py would
+        be caught here.
+        """
+        import time as time_mod
+
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.core.kv_cache_utils import (
+            BlockHash,
+            make_block_hash_with_group_id,
+        )
+
+        pool = self._make_pool()
+        block = pool.blocks[1]
+        pool.free_block_queue.remove(block)
+        block.ref_cnt = 1
+        raw_old = BlockHash((123).to_bytes(32, "little"))
+        h_old = make_block_hash_with_group_id(raw_old, 0)
+        block.block_hash = h_old
+        pool.cached_block_hash_to_block.insert(h_old, block)
+
+        monkeypatch.setattr(time_mod, "monotonic", lambda: 100.0)
+        _set_meta(
+            pool.priority_eviction_queue,
+            block,
+            priority=50,
+            expiry=None,
+            last_freed=100.0,
+        )
+        pool.free_blocks([block])
+
+        # Drain LRU + pop the priority-queue entry. Block now carries
+        # h_old; cache map still has h_old → block (per Task 1's fix).
+        for b in list(pool.free_block_queue.get_all_free_blocks()):
+            if b is not block and b is not pool.null_block:
+                pool.free_block_queue.remove(b)
+                b.ref_cnt = 1
+        pool.get_new_blocks(1)
+        assert block.block_hash == h_old, (
+            "PQ pop should preserve the old hash for prefix-hit purposes."
+        )
+        cached_old = pool.get_cached_block(raw_old, [0])
+        assert cached_old is not None and cached_old[0] is block
+
+        # Now drive cache_full_blocks with a NEW raw hash. The real code
+        # path must lazy-clean h_old from the cache map before
+        # registering h_new — this exercises the
+        # `if blk.block_hash is not None: self._maybe_evict_cached_block(blk)`
+        # branch in block_pool.cache_full_blocks.
+        raw_new = BlockHash((456).to_bytes(32, "little"))
+        h_new = make_block_hash_with_group_id(raw_new, 0)
+
+        # Minimal stub request — same pattern as
+        # test_cache_full_blocks_routes_directives_to_queue. Without
+        # extra_args the retention hook is a no-op, and with
+        # enable_kv_cache_events=False the events branch is skipped, so
+        # only block_hashes is load-bearing.
+        class _Req:
+            sampling_params: SamplingParams
+            block_hashes: list
+
+        request = _Req()
+        request.sampling_params = SamplingParams()
+        request.block_hashes = [raw_new]
+
+        pool.cache_full_blocks(
+            request=request,
+            blocks=[block],
+            num_cached_blocks=0,
+            num_full_blocks=1,
+            block_size=pool.hash_block_size,
+            kv_cache_group_id=0,
+        )
+
+        assert pool.get_cached_block(raw_old, [0]) is None, (
+            "cache_full_blocks must lazy-clean the stale hash before "
+            "assigning the new one."
+        )
+        assert block.block_hash == h_new, (
+            "cache_full_blocks must register the new hash on the block."
+        )
+        cached_new = pool.get_cached_block(raw_new, [0])
+        assert cached_new is not None and cached_new[0] is block
+
+    def test_prefix_hit_after_priority_queue_pop(self, monkeypatch):
+        """End-to-end behavior: after a block is popped via the
+        priority queue (ref_cnt becomes 1), a subsequent
+        get_cached_block call for the same hash still returns that
+        block. This is what the eviction-storm fix is for: the cache
+        map entry survives across a PQ-driven allocation so the next
+        prefix-matching request can hit.
+        """
+        import time as time_mod
+
+        from vllm.v1.core.kv_cache_utils import (
+            BlockHash,
+            make_block_hash_with_group_id,
+        )
+
+        pool = self._make_pool()
+        block = pool.blocks[1]
+        pool.free_block_queue.remove(block)
+        block.ref_cnt = 1
+        raw_hash = BlockHash((321).to_bytes(32, "little"))
+        h = make_block_hash_with_group_id(raw_hash, 0)
+        block.block_hash = h
+        pool.cached_block_hash_to_block.insert(h, block)
+
+        monkeypatch.setattr(time_mod, "monotonic", lambda: 100.0)
+        _set_meta(
+            pool.priority_eviction_queue,
+            block,
+            priority=50,
+            expiry=None,
+            last_freed=100.0,
+        )
+        pool.free_blocks([block])
+
+        # Drain LRU + pop priority queue → block.ref_cnt = 1.
+        for b in list(pool.free_block_queue.get_all_free_blocks()):
+            if b is not block and b is not pool.null_block:
+                pool.free_block_queue.remove(b)
+                b.ref_cnt = 1
+        pool.get_new_blocks(1)
+        assert block.ref_cnt == 1
+
+        # The cache hit must still resolve. (The application would now
+        # touch() this block; touch() handles ref_cnt > 0 correctly
+        # without trying to remove from any queue.)
+        hit = pool.get_cached_block(raw_hash, [0])
+        assert hit is not None and hit[0] is block, (
+            "Prefix-cache hit must succeed after priority-queue pop; "
+            "this is the cache-eviction-storm regression guard."
+        )
 
 
 class TestStructuralInvariants:

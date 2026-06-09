@@ -267,6 +267,13 @@ class BlockPool:
             # align mode. We skip null blocks here.
             if blk.is_null:
                 continue
+            # Lazy cleanup: a block popped from the priority queue
+            # retains its prior hash (so it could keep serving prefix
+            # hits between pop and reuse). Now that we're about to
+            # assign a new hash, drop the stale
+            # cached_block_hash_to_block entry and reset.
+            if blk.block_hash is not None:
+                self._maybe_evict_cached_block(blk)
             assert blk.block_hash is None
             block_hash = new_block_hashes[i]
 
@@ -364,39 +371,72 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
+        # Demote any expired retention entries to the LRU tail before any
+        # eviction decision. Expired = "protection released", not "evict
+        # immediately". Leaving them in the priority queue makes them top
+        # eviction candidates and resets their cached hashes on the very
+        # next pop_lowest — destroying prefix cache hit rate (see 1B
+        # smoke regression).
+        for block_id in self.priority_eviction_queue.drain_expired():
+            self.free_block_queue.append(self.blocks[block_id])
+
         # Fast path: no prioritized blocks → pure LRU (zero overhead).
-        ret: list[KVCacheBlock]
         if self.priority_eviction_queue.num_blocks == 0:
             ret = self.free_block_queue.popleft_n(num_blocks)
-        else:
-            # Drain unprioritized blocks from the LRU free list first, then
-            # take lowest-priority blocks from the priority queue.
-            num_from_free = min(num_blocks, self.free_block_queue.num_free_blocks)
-            ret = (
-                self.free_block_queue.popleft_n(num_from_free) if num_from_free else []
-            )
-            while len(ret) < num_blocks:
-                evicted = self.priority_eviction_queue.pop_lowest()
-                assert evicted is not None, (
-                    "Priority queue empty but more blocks required"
-                )
-                ret.append(evicted)
+            if self.enable_caching:
+                for block in ret:
+                    # LRU popleft = explicit "evict now" signal: drop the
+                    # prefix cache entry and reset the hash.
+                    self._maybe_evict_cached_block(block)
+                    assert block.ref_cnt == 0
+                    block.ref_cnt += 1
+                    if self.metrics_collector:
+                        self.metrics_collector.on_block_allocated(block)
+            else:
+                for block in ret:
+                    assert block.ref_cnt == 0
+                    block.ref_cnt += 1
+                    if self.metrics_collector:
+                        self.metrics_collector.on_block_allocated(block)
+            return ret
 
-        # In order to only iterate the list once, we duplicated code a bit
+        # Mixed path: take what we can from LRU, top up from the
+        # priority queue. Track the source so we can apply different
+        # cache-map handling per source.
+        num_from_free = min(num_blocks, self.free_block_queue.num_free_blocks)
+        from_lru = (
+            self.free_block_queue.popleft_n(num_from_free) if num_from_free else []
+        )
+        from_pq: list[KVCacheBlock] = []
+        while len(from_lru) + len(from_pq) < num_blocks:
+            evicted = self.priority_eviction_queue.pop_lowest()
+            assert evicted is not None, "Priority queue empty but more blocks required"
+            from_pq.append(evicted)
+
         if self.enable_caching:
-            for block in ret:
+            for block in from_lru:
+                # LRU evict semantics: drop cache map + reset hash.
                 self._maybe_evict_cached_block(block)
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
-        else:
-            for block in ret:
+            for block in from_pq:
+                # Priority-queue pop = reorder, not evict-from-cache.
+                # Preserve block.block_hash and the cache map entry;
+                # cache_full_blocks will clean up lazily when this
+                # block is reused with a new hash.
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
-        return ret
+        else:
+            for block in from_lru + from_pq:
+                assert block.ref_cnt == 0
+                block.ref_cnt += 1
+                if self.metrics_collector:
+                    self.metrics_collector.on_block_allocated(block)
+        return from_lru + from_pq
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
         """
@@ -444,13 +484,24 @@ class BlockPool:
             blocks: A list of blocks to touch.
         """
         for block in blocks:
-            # ref_cnt=0 means this block is in a free queue (LRU or
-            # priority); remove it from whichever queue it sits in.
+            # ref_cnt=0 means this block is logically free; remove it from
+            # whichever queue it sits in. A block can be in the priority
+            # queue, the LRU free list, or — defensively — neither (limbo).
+            # Check membership at the queue level rather than assuming the
+            # boolean complement of "in priority queue".
             if block.ref_cnt == 0 and not block.is_null:
                 if block in self.priority_eviction_queue:
                     self.priority_eviction_queue.remove(block)
-                else:
+                elif (
+                    block.prev_free_block is not None
+                    or block.next_free_block is not None
+                ):
                     self.free_block_queue.remove(block)
+                # else: block is in neither queue. This is a defensive
+                # branch — current code paths should keep the two queues
+                # exhaustive for ref_cnt=0 cached blocks. If it triggers,
+                # the bookkeeping invariant in priority_eviction_queue +
+                # free_block_queue has been violated upstream.
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
