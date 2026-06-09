@@ -99,6 +99,12 @@ async def init_generate_state(
         if "generate" in supported_tasks
         else None
     )
+
+    # Share tool_server (stateless) for Harmony system messages; stateful
+    # stores stay in OpenAIServingResponses and are passed in per request.
+    if state.openai_serving_responses is not None:
+        state.openai_serving_render.tool_server = tool_server
+
     _chat_kwargs = dict(
         engine_client=engine_client,
         models=state.openai_serving_models,
