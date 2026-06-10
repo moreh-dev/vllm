@@ -207,6 +207,68 @@ async def test_serve_tokens_skips_mm_cache_for_remote_engine_execution():
 
 
 @pytest.mark.asyncio
+async def test_non_stream_usage():
+    """Non-streaming responses include token usage."""
+    engine = _mock_engine()
+
+    async def mock_generate(*args, **kwargs):
+        yield _make_request_output("req-1", token_ids=[10])
+        yield _make_request_output(
+            "req-1", token_ids=[10, 20], finish_reason="stop", finished=True
+        )
+
+    engine.generate = MagicMock(side_effect=mock_generate)
+    serving = _build_serving_tokens(engine)
+
+    request = GenerateRequest(
+        token_ids=[1, 2, 3],
+        sampling_params=SamplingParams(max_tokens=10),
+        model=MODEL_NAME,
+        stream=False,
+    )
+
+    response = await serving.serve_tokens(request)
+
+    assert isinstance(response, GenerateResponse)
+    assert response.usage is not None
+    assert response.usage.prompt_tokens == 3
+    assert response.usage.completion_tokens == 2
+    assert response.usage.total_tokens == 5
+
+
+@pytest.mark.asyncio
+async def test_non_stream_prompt_tokens_details():
+    """enable_prompt_tokens_details includes cached_tokens in usage."""
+    engine = _mock_engine()
+
+    async def mock_generate(*args, **kwargs):
+        yield _make_request_output(
+            "req-1",
+            token_ids=[10],
+            finish_reason="stop",
+            finished=True,
+            num_cached_tokens=2,
+        )
+
+    engine.generate = MagicMock(side_effect=mock_generate)
+    serving = _build_serving_tokens(engine, enable_prompt_tokens_details=True)
+
+    request = GenerateRequest(
+        token_ids=[1, 2, 3],
+        sampling_params=SamplingParams(max_tokens=10),
+        model=MODEL_NAME,
+        stream=False,
+    )
+
+    response = await serving.serve_tokens(request)
+
+    assert isinstance(response, GenerateResponse)
+    assert response.usage is not None
+    assert response.usage.prompt_tokens_details is not None
+    assert response.usage.prompt_tokens_details.cached_tokens == 2
+
+
+@pytest.mark.asyncio
 async def test_stream_basic():
     """Streaming returns SSE chunks with correct token_ids and ends with [DONE]."""
     engine = _mock_engine()

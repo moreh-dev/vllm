@@ -202,6 +202,7 @@ class GenerateResponse(BaseModel):
         ),
     )
     choices: list[GenerateResponseChoice]
+    usage: UsageInfo | None = Field(default=None)
 
     prompt_logprobs: list[dict[int, Logprob] | None] | None = None
 
