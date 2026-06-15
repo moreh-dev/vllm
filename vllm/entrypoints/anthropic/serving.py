@@ -27,7 +27,10 @@ from vllm.entrypoints.anthropic.protocol import (
     AnthropicStreamEvent,
     AnthropicUsage,
 )
-from vllm.entrypoints.chat_utils import ChatTemplateContentFormatOption
+from vllm.entrypoints.chat_utils import (
+    ChatTemplateContentFormatOption,
+    ConversationMessage,
+)
 from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
@@ -42,6 +45,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     StreamOptions,
 )
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+from vllm.inputs import EngineInput
 
 if TYPE_CHECKING:
     from vllm.entrypoints.serve.render.serving import OpenAIServingRender
@@ -408,6 +412,21 @@ class AnthropicServingMessages(OpenAIServingChat):
         if req.tool_choice is None:
             req.tool_choice = "auto"
         req.tools = tools
+
+    async def render_messages_request(
+        self,
+        request: AnthropicMessagesRequest,
+    ) -> tuple[list[ConversationMessage], list[EngineInput]] | ErrorResponse:
+        """Validate the model and preprocess an Anthropic Messages request.
+
+        Converts the request to the OpenAI chat format using the same
+        conversion as create_messages, then delegates to the inherited
+        render_chat_request so the rendered tokens match the /v1/messages
+        serving path exactly. Used by the embedded kv-cache tokenizer to
+        prefix-cache-route /v1/messages requests.
+        """
+        chat_req = self._convert_anthropic_to_openai_request(request)
+        return await self.render_chat_request(chat_req)
 
     async def create_messages(
         self,
