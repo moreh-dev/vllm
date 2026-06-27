@@ -3,3 +3,5 @@
 self-hosted-runner:
   labels:
     - vllm-runners
+    # moreh internal runner pool (access to the 192.168.212.30 registry)
+    - github-runner

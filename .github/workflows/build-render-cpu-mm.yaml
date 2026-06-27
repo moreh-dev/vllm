@@ -1,0 +1,116 @@
+# Builds and pushes the GPU-less CPU vLLM "render" image used by the Heimdall
+# token-producer plugin's render sidecar. The image is run as
+# `vllm launch render <model> ...` and must serve /v1/responses/render, which
+# lives on the moreh response-render branches.
+#
+# This workflow builds the branch it is dispatched from ("Use workflow from"),
+# so it must exist on BOTH the default branch (so the Run workflow button shows)
+# and on each response-render branch you want to build from. A guard fails fast
+# if the selected ref does not serve /v1/responses/render.
+#
+# Publishes: 192.168.212.30:1780/moreh/vllm-render-cpu-mm:<version>
+# The default tag is the nearest git version tag (e.g. v0.22.0 -> 0.22.0).
+# Runs on a self-hosted runner because the registry is internal.
+name: Build vllm-render-cpu-mm
+
+concurrency:
+  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Override published tag. Empty = nearest git version tag (e.g. v0.22.0 -> 0.22.0)"
+        default: ""
+        required: false
+      target:
+        description: "docker/Dockerfile.cpu build stage to target"
+        default: "vllm-openai"
+        required: true
+      push:
+        description: "Push to the internal registry after building"
+        type: boolean
+        default: true
+
+env:
+  IMAGE: 192.168.212.30:1780/moreh/vllm-render-cpu-mm
+  PYTHON_VERSION: "3.12"
+  DOCKER_BUILDKIT: "1"
+
+jobs:
+  build-render-cpu-mm:
+    runs-on: [self-hosted, github-runner]
+    steps:
+      # Builds the branch selected in "Use workflow from" (github.ref).
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          # Full history + tags so `git describe` can find the nearest version tag.
+          fetch-depth: 0
+          token: ${{ secrets.INTERNAL_ACCESS_TOKEN }}
+
+      # The render sidecar needs /v1/responses/render, which only the
+      # response-render branches carry. Fail fast on e.g. main.
+      - name: Guard - ref must serve /v1/responses/render
+        run: |
+          if ! grep -rq "/v1/responses/render" vllm/entrypoints; then
+            echo "::error::Ref '${{ github.ref_name }}' does not serve /v1/responses/render; dispatch from a response-render branch."
+            exit 1
+          fi
+
+      # Default tag = nearest version tag of the checked-out ref (v0.22.0 -> 0.22.0).
+      # An explicit `tag` input overrides it.
+      - name: Resolve image tag
+        id: tag
+        run: |
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            RAW=$(git describe --tags --abbrev=0)
+            TAG="${RAW#v}"
+            echo "Nearest git tag ${RAW} -> image tag ${TAG}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Login to internal registry
+        run: |
+          echo "${{ secrets.REGISTRY_PASSWORD }}" | docker login 192.168.212.30:1780 \
+            -u "${{ secrets.REGISTRY_USERNAME }}" --password-stdin
+
+      # Standard CPU vLLM build. Args mirror the published image's labels
+      # (python 3.12, amd64, no x86/arm-bf16 micro-arch tuning).
+      - name: Build CPU vLLM image (render base)
+        run: |
+          docker build \
+            -f docker/Dockerfile.cpu \
+            --target "${{ inputs.target }}" \
+            --platform linux/amd64 \
+            --build-arg PYTHON_VERSION="${PYTHON_VERSION}" \
+            --build-arg VLLM_CPU_X86=0 \
+            --build-arg VLLM_CPU_ARM_BF16=0 \
+            -t "vllm-render-cpu-base:${{ github.run_id }}" .
+
+      # Multimodal variant: the render sidecar tokenizes audio/video content, so
+      # add the audio decode stack. This is the only delta from the base image.
+      - name: Add multimodal (audio) deps and tag
+        run: |
+          printf 'FROM vllm-render-cpu-base:%s\nRUN python3 -m pip install --no-cache-dir librosa soundfile\n' \
+            "${{ github.run_id }}" > Dockerfile.render-mm
+          docker build -f Dockerfile.render-mm -t "${IMAGE}:${{ steps.tag.outputs.tag }}" .
+
+      # The image is used via `vllm launch render`, so verify that subcommand
+      # exists in the build (the default entrypoint is `vllm serve`).
+      - name: Smoke test - vllm launch render is available
+        run: |
+          docker run --rm --entrypoint vllm "${IMAGE}:${{ steps.tag.outputs.tag }}" launch render --help | head -n 5
+
+      - name: Push
+        if: ${{ inputs.push }}
+        run: docker push "${IMAGE}:${{ steps.tag.outputs.tag }}"
+
+      - name: Cleanup local tags
+        if: always()
+        run: |
+          docker image rm \
+            "vllm-render-cpu-base:${{ github.run_id }}" \
+            "${IMAGE}:${{ steps.tag.outputs.tag }}" 2>/dev/null || true
