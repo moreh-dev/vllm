@@ -9,6 +9,7 @@ from vllm.entrypoints.openai.models.serving import (
     OpenAIModelRegistry,
     OpenAIServingModels,
 )
+from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.entrypoints.scale_out.token_in_token_out.mm_serde import encode_mm_kwargs_item
 from vllm.entrypoints.scale_out.token_in_token_out.protocol import (
     GenerateRequest,
@@ -207,6 +208,69 @@ class ServingRender(BaseServing):
             )
 
         return generate_requests
+
+    async def render_responses_request(
+        self,
+        request: ResponsesRequest,
+    ) -> GenerateRequest | ErrorResponse:
+        """Validate the model and preprocess a responses request.
+
+        This is the authoritative implementation used directly by the
+        GPU-less render server. The stateful stores (response_store,
+        msg_store) live in OpenAIServingResponses, so only new
+        conversations (no previous_response_id) can be rendered here.
+        """
+        error_check_ret = await self._check_model(request)
+        if error_check_ret is not None:
+            logger.error("Error with model %s", error_check_ret)
+            return error_check_ret
+
+        # GPU-less render server has no store; only new conversations.
+        result = await self.online_renderer.render_responses(
+            request, prev_response=None, prev_messages=None, skip_mm_cache=True
+        )
+        if isinstance(result, ErrorResponse):
+            return result
+
+        _, engine_inputs = result
+
+        if len(engine_inputs) != 1:
+            return self.create_error_response(
+                f"Expected exactly 1 engine prompt, got {len(engine_inputs)}"
+            )
+
+        engine_input = engine_inputs[0]
+
+        prompt_components = extract_prompt_components(self.model_config, engine_input)
+        token_ids = prompt_components.token_ids
+        if not token_ids:
+            return self.create_error_response("No token_ids rendered")
+        token_ids = list(token_ids)
+
+        input_length = extract_prompt_len(self.model_config, engine_input)
+        max_tokens = get_max_tokens(
+            self.model_config.max_model_len,
+            request.max_output_tokens,
+            input_length,
+            self.default_sampling_params,
+            self.override_max_tokens,
+            truncate_prompt_tokens=(-1 if request.truncation != "disabled" else None),
+        )
+        params = request.to_sampling_params(max_tokens, self.default_sampling_params)
+
+        request_id = f"resp-{random_uuid()}"
+
+        return GenerateRequest(
+            request_id=request_id,
+            token_ids=token_ids,
+            features=self._extract_mm_features(engine_input),
+            sampling_params=params,
+            model=request.model,
+            stream=bool(request.stream),
+            stream_options=None,
+            cache_salt=request.cache_salt,
+            priority=request.priority,
+        )
 
     @staticmethod
     def _extract_mm_features(

@@ -43,7 +43,6 @@ from vllm.entrypoints.openai.responses.protocol import (
 )
 from vllm.entrypoints.openai.responses.serving import (
     OpenAIServingResponses,
-    _extract_allowed_tools_from_mcp_requests,
     extract_tool_types,
 )
 from vllm.entrypoints.openai.responses.streaming_events import (
@@ -52,6 +51,9 @@ from vllm.entrypoints.openai.responses.streaming_events import (
 from vllm.inputs import tokens_input
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.parser.harmony import Segment
+from vllm.renderers.online_renderer import (
+    _extract_allowed_tools_from_mcp_requests,
+)
 from vllm.sampling_params import SamplingParams
 
 
