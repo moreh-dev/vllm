@@ -22,10 +22,10 @@ def test_is_empty_on_fresh_stats():
 
 def test_record_transfer_and_reduce():
     stats = MooncakeKVConnectorStats()
-    # 1 MB transfer in 1 ms -> 1000 MB/s throughput
+    # 1 MB transfer in 1 ms -> 1000 MB/s
     stats.record_transfer(duration_s=0.001, total_bytes=1 * 2**20, num_descs=4)
-    # 2 MB transfer in 2 ms
-    stats.record_transfer(duration_s=0.002, total_bytes=2 * 2**20, num_descs=6)
+    # 4 MB transfer in 2 ms -> 2000 MB/s
+    stats.record_transfer(duration_s=0.002, total_bytes=4 * 2**20, num_descs=6)
     assert not stats.is_empty()
     assert stats.num_successful_transfers == 2
 
@@ -33,9 +33,10 @@ def test_record_transfer_and_reduce():
     assert reduced["Num successful transfers"] == 2
     # avg = (1 + 2) / 2 = 1.5 ms
     assert reduced["Avg xfer time (ms)"] == 1.5
-    assert reduced["Avg MB per transfer"] == 1.5
-    # 3 MB total / 3 ms total = 1000 MB/s
-    assert reduced["Throughput (MB/s)"] == 1000.0
+    assert reduced["Avg MB per transfer"] == 2.5
+    # Mean of per-transfer rates: (1000 + 2000) / 2. Transfers may overlap,
+    # so total MB / summed durations (5 MB / 3 ms = 1666.7) would be wrong.
+    assert reduced["Avg per-transfer throughput (MB/s)"] == 1500.0
     assert reduced["Avg number of descriptors"] == 5.0
     assert reduced["Num failed transfers"] == 0
     assert reduced["Num failed recvs"] == 0

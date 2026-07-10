@@ -109,7 +109,7 @@ class MooncakeKVConnectorStats(KVConnectorStats):
                 "Avg xfer time (ms)": 0,
                 "P90 xfer time (ms)": 0,
                 "Avg MB per transfer": 0,
-                "Throughput (MB/s)": 0,
+                "Avg per-transfer throughput (MB/s)": 0,
                 "Avg number of descriptors": 0,
                 "Num failed transfers": num_failed_transfers,
                 "Num failed recvs": num_failed_recvs,
@@ -124,9 +124,10 @@ class MooncakeKVConnectorStats(KVConnectorStats):
 
         total_mb = mb.sum()
         avg_mb = total_mb / n
-        total_time_seconds = xfer_time.sum()
-        throughput_mb_s = (
-            total_mb / total_time_seconds if total_time_seconds > 0 else 0.0
+        # Mean of per-transfer rates. Transfers overlap, so dividing by the
+        # summed durations would double-count wall time under concurrency.
+        rates_mb_s = np.divide(
+            mb, xfer_time, out=np.zeros_like(mb), where=xfer_time > 0
         )
 
         return {
@@ -134,7 +135,7 @@ class MooncakeKVConnectorStats(KVConnectorStats):
             "Avg xfer time (ms)": round(xfer_time.mean() * 1e3, 3),
             "P90 xfer time (ms)": round(np.percentile(xfer_time, 90).item() * 1e3, 3),
             "Avg MB per transfer": round(avg_mb, 3),
-            "Throughput (MB/s)": round(throughput_mb_s, 3),
+            "Avg per-transfer throughput (MB/s)": round(rates_mb_s.mean(), 3),
             "Avg number of descriptors": round(descs.mean(), 1),
             "Num failed transfers": num_failed_transfers,
             "Num failed recvs": num_failed_recvs,

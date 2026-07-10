@@ -95,7 +95,7 @@ class NixlKVConnectorStats(KVConnectorStats):
                 "Avg post time (ms)": 0,
                 "P90 post time (ms)": 0,
                 "Avg MB per transfer": 0,
-                "Throughput (MB/s)": 0,
+                "Avg per-transfer throughput (MB/s)": 0,
                 "Avg number of descriptors": 0,
             }
 
@@ -110,8 +110,11 @@ class NixlKVConnectorStats(KVConnectorStats):
         total_mb = mb.sum()
         avg_mb = total_mb / n
 
-        total_time_seconds = xfer_time.sum()
-        throughput_mb_s = total_mb / total_time_seconds
+        # Mean of per-transfer rates. Transfers overlap, so dividing by the
+        # summed durations would double-count wall time under concurrency.
+        rates_mb_s = np.divide(
+            mb, xfer_time, out=np.zeros_like(mb), where=xfer_time > 0
+        )
 
         return {
             "Num successful transfers": n,
@@ -120,7 +123,7 @@ class NixlKVConnectorStats(KVConnectorStats):
             "Avg post time (ms)": round(post_time.mean() * 1e3, 3),
             "P90 post time (ms)": round(np.percentile(post_time, 90).item() * 1e3, 3),
             "Avg MB per transfer": round(avg_mb, 3),
-            "Throughput (MB/s)": round(throughput_mb_s, 3),
+            "Avg per-transfer throughput (MB/s)": round(rates_mb_s.mean(), 3),
             "Avg number of descriptors": round(descs.mean(), 1),
         }
 

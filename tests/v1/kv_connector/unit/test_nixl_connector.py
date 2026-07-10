@@ -1342,6 +1342,28 @@ def test_kv_connector_stats(default_vllm_config, dist_init):
     assert stats_after_reset is None
 
 
+def test_kv_connector_stats_reduce_avg_per_transfer_throughput():
+    """reduce() reports the mean of per-transfer rates.
+
+    Transfers overlap, so total MB / summed durations would double-count
+    wall time and understate throughput under concurrency.
+    """
+    stats = NixlKVConnectorStats()
+    # 1 MB in 1 s -> 1 MB/s
+    stats.record_transfer(
+        get_default_xfer_telemetry(xferDurationS=1, totalBytes=1 * 2**20)
+    )
+    # 4 MB in 2 s -> 2 MB/s
+    stats.record_transfer(
+        get_default_xfer_telemetry(xferDurationS=2, totalBytes=4 * 2**20)
+    )
+
+    cli_stats = stats.reduce()
+    assert cli_stats["Avg MB per transfer"] == 2.5
+    # Mean of per-transfer rates: (1 + 2) / 2, not 5 MB / 3 s = 1.667.
+    assert cli_stats["Avg per-transfer throughput (MB/s)"] == 1.5
+
+
 def test_kv_connector_stats_aggregation():
     """
     Test KV transfer stats aggregation across TP ranks using

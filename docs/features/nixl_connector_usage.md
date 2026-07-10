@@ -431,7 +431,8 @@ activity for the last reporting interval. Example output:
 ```text
 KV Transfer metrics: Num successful transfers=4, Avg xfer time (ms)=1.381,
 P90 xfer time (ms)=2.601, Avg post time (ms)=0.672, P90 post time (ms)=0.801,
-Avg MB per transfer=2.25, Throughput (MB/s)=1629.549, Avg number of descriptors=72.0
+Avg MB per transfer=2.25, Avg per-transfer throughput (MB/s)=1629.549,
+Avg number of descriptors=72.0
 ```
 
 The table below describes each field. All timing values cover only the
@@ -447,7 +448,7 @@ counted separately via Prometheus (see
 | `Avg post time (ms)` | ms | Mean time to submit the transfer request to the RDMA backend (`postDuration` in NIXL telemetry). This is the synchronous cost of posting work to the NIC queue (descriptor setup, etc.) before the async data movement begins. |
 | `P90 post time (ms)` | ms | 90th-percentile request-posting duration. Elevated P90 here (with low xfer P90) points to overhead in submitting requests rather than in the data transfer itself. |
 | `Avg MB per transfer` | MB | Mean payload size per transfer, computed as `total bytes transferred / number of transfers`. Reflects the average KV cache footprint of a single request (sequence length × layers × head dimension × dtype bytes). |
-| `Throughput (MB/s)` | MB/s | Effective bandwidth over the interval: `total MB transferred / total xfer time (s)` across all successful transfers. This is aggregate throughput, not per-request bandwidth. |
+| `Avg per-transfer throughput (MB/s)` | MB/s | Mean of per-transfer rates (`bytes / xfer time`, averaged over transfers). Measures the rate a single rank-level transfer experiences end-to-end, which is what to compare against link bandwidth. This is not aggregate wall-clock throughput: transfers overlap, so summing their durations would double-count wall time — use the Prometheus counters with `rate()` for aggregate throughput. |
 | `Avg number of descriptors` | count | Mean number of NIXL memory descriptors (scatter-gather segments) submitted per transfer. More descriptors indicate more fragmented or larger KV cache allocations; very high counts can increase descriptor-registration overhead. |
 
 ### Prometheus metrics
