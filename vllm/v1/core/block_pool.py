@@ -384,10 +384,18 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        # Demote expired entries to the LRU tail before any eviction decision:
-        # expiry means "protection released", not "evict now".
-        for block_id in self.priority_eviction_queue.release_expired():
-            self.free_block_queue.append(self.blocks[block_id])
+        # Demote expired protections to the LRU TAIL (recency-warm), batched.
+        # Expiry means "protection released", not "evict now": a TTL
+        # underestimate would otherwise mass-evict blocks that are still the
+        # live working set (head demotion is punitive). Treating a lapsed
+        # protection as freshly freed keeps it a normal LRU candidate, bounded
+        # by the retention budget.
+        expired = [
+            self.blocks[block_id]
+            for block_id in self.priority_eviction_queue.release_expired()
+        ]
+        if expired:
+            self.free_block_queue.append_n(expired)
 
         # LRU first, then top up from the priority queue (lowest priority
         # first). With nothing prioritized the while loop never runs (pure-LRU
