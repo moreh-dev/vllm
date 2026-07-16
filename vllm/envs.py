@@ -280,6 +280,7 @@ if TYPE_CHECKING:
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
+    VLLM_RETENTION_BUDGET_FRAC: float = 0.6
 
 
 def get_default_cache_root():
@@ -1057,6 +1058,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.environ["VLLM_PREFIX_CACHE_RETENTION_INTERVAL"])
         if "VLLM_PREFIX_CACHE_RETENTION_INTERVAL" in os.environ
         else None
+    ),
+    # Fraction of GPU KV-cache blocks the priority-based retention (protected)
+    # pool may hold. Protections beyond this degrade to plain LRU so the
+    # unprotected working set is never squeezed into thrash. 0 disables
+    # retention (every block falls through to LRU); 1.0 allows using all blocks.
+    "VLLM_RETENTION_BUDGET_FRAC": lambda: float(
+        os.getenv("VLLM_RETENTION_BUDGET_FRAC", "0.6")
     ),
     # a local directory to look in for unrecognized LoRA adapters.
     # only works if plugins are enabled and
