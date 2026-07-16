@@ -483,14 +483,23 @@ class BlockPool:
         blocks_with_hash = []
         blocks_without_hash = []
         # Stamp the current monotonic time so the priority-queue heap tiebreak
-        # reflects this most-recent free.
+        # reflects this most-recent free. A per-block nanosecond offset by
+        # position makes the priority queue evict tail-first (prefix head last),
+        # matching the LRU free-list order: ordered_blocks arrives tail->head
+        # (the caller frees in reverse), so an increasing offset makes
+        # pop_lowest drain the tail before the prefix head instead of an
+        # arbitrary block_id tiebreak that can strand a mid-prefix block and
+        # break the cached chain. The offset (~1e-9 * n) is far smaller than
+        # real inter-free gaps, so cross-request recency ordering is unaffected.
         now = time.monotonic()
-        for block in ordered_blocks:
+        for pos, block in enumerate(ordered_blocks):
             block.ref_cnt -= 1
             if block.ref_cnt == 0 and not block.is_null:
                 # Protected blocks go to the priority queue; try_insert
                 # returns False for the rest, which fall through to LRU.
-                if self.priority_eviction_queue.try_insert(block, last_freed_time=now):
+                if self.priority_eviction_queue.try_insert(
+                    block, last_freed_time=now + pos * 1e-9
+                ):
                     continue
                 if block.block_hash is None:
                     blocks_without_hash.append(block)
