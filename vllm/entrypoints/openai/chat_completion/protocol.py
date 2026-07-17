@@ -407,7 +407,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
         description=(
             "Retention directives for priority-based KV-cache eviction. "
             "Each directive: {start: int, end: int|null, "
-            "priority: int (0-100), duration: float|null}."
+            "priority: int (0-100), duration: float|null}. "
+            "Alternatively {covers_output: true, priority, duration} pins the "
+            "generated tail (resolved server-side to the output token range)."
         ),
     )
 
@@ -708,10 +710,17 @@ class ChatCompletionRequest(OpenAIBaseModel):
         directives = data.get("retention_directives")
         if not directives:
             return data
-        # Sort by token start position; ties broken by original order.
+        # Sort by token start position; ties broken by original order. A
+        # covers_output directive has no explicit start and pins the generated
+        # tail, so treat it as the deepest position.
         sorted_directives = sorted(
             enumerate(directives),
-            key=lambda pair: (pair[1].get("start", 0), pair[0]),
+            key=lambda pair: (
+                float("inf")
+                if pair[1].get("covers_output")
+                else pair[1].get("start", 0),
+                pair[0],
+            ),
         )
         prev_priority: int | None = None
         prev_start: int | None = None

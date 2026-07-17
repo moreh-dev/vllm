@@ -363,6 +363,19 @@ class BlockPool:
         scope = extra.get("retention_scope")
         if directives is None and scope is None:
             return
+        if directives:
+            # A covers_output directive protects the generated tail. It carries
+            # no explicit start; resolve it to [num_prompt_tokens, None) so it
+            # pins the output range rather than defaulting to start=0 (which
+            # would pin the whole prompt).
+            num_prompt_tokens = getattr(request, "num_prompt_tokens", None)
+            if num_prompt_tokens is not None:
+                directives = [
+                    {**d, "start": num_prompt_tokens, "end": None}
+                    if d.get("covers_output")
+                    else d
+                    for d in directives
+                ]
         self.priority_eviction_queue.apply_directives(
             blocks[:num_full_blocks],
             directives or [],
