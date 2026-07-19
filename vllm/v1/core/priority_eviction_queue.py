@@ -176,6 +176,21 @@ class PriorityEvictionQueue:
                     scope=scope,
                     last_freed_time=current.last_freed_time if current else 0.0,
                 )
+            elif current is not None and best_priority == current_priority:
+                # Equal-priority covering reuse (any scope): refresh the expiry so a
+                # shared prefix reused across sessions does not lapse. Keep the
+                # original owner and priority — a cross-scope caller may only EXTEND
+                # the hold, never downgrade or steal ownership.
+                self._meta[block.block_id] = RetentionMeta(
+                    priority=current.priority,
+                    expiry=(
+                        None
+                        if (expiry is None or current.expiry is None)
+                        else max(expiry, current.expiry)
+                    ),
+                    scope=current.scope,
+                    last_freed_time=current.last_freed_time,
+                )
             elif current is not None and scope is not None and current.scope == scope:
                 # Same scope: owner may downgrade or refresh.
                 self._meta[block.block_id] = RetentionMeta(
