@@ -103,6 +103,7 @@ async def client(server: RemoteOpenAIServer):
 @pytest.mark.asyncio
 async def test_generate_endpoint(client):
     payload = {
+        "request_id": "generate-test-request",
         "model": MODEL_NAME,
         "token_ids": [1, 2, 3],
         "sampling_params": {"max_tokens": 5},
@@ -112,6 +113,7 @@ async def test_generate_endpoint(client):
     resp.raise_for_status()
     data = resp.json()
     assert "choices" in data
+    assert data["request_id"] == "generate-tokens-generate-test-request"
 
 
 @pytest.mark.asyncio
