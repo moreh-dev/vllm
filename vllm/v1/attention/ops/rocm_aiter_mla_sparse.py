@@ -907,6 +907,154 @@ def rocm_aiter_sparse_attn_indexer(
     return topk_indices_buffer
 
 
+# Rope cos/sin halves for the fused indexer QK kernel, registered on the
+# indexer's rotary embedding module. ``cos_sin_cache`` is ``cat((cos, sin),
+# dim=-1)`` and constant after init, but the kernel wants the halves
+# separately. Splitting them per forward would re-emit a full-table rewrite
+# per layer per step; the registered views cost nothing (the kernel indexes
+# them by row stride and only requires the last dim to be contiguous).
+_INDEXER_ROPE_COS_ATTR = "aiter_indexer_rope_cos"
+_INDEXER_ROPE_SIN_ATTR = "aiter_indexer_rope_sin"
+
+
+def register_indexer_rope_halves(rope: torch.nn.Module) -> None:
+    cache = getattr(rope, "cos_sin_cache", None)
+    if not isinstance(cache, torch.Tensor) or cache.ndim != 2:
+        return
+    half = cache.shape[-1] // 2
+    rope.register_buffer(_INDEXER_ROPE_COS_ATTR, cache[:, :half], persistent=False)
+    rope.register_buffer(_INDEXER_ROPE_SIN_ATTR, cache[:, half:], persistent=False)
+
+
+def get_indexer_rope_halves(
+    rope: torch.nn.Module, dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """cos/sin halves in ``dtype`` from the buffers registered at init.
+
+    The fallback covers a rope whose cache was rebuilt or re-typed after
+    registration; both branches resolve at trace time.
+    """
+    cos = getattr(rope, _INDEXER_ROPE_COS_ATTR, None)
+    sin = getattr(rope, _INDEXER_ROPE_SIN_ATTR, None)
+    if cos is not None and sin is not None and cos.dtype == dtype:
+        return cos, sin
+    cache = rope.cos_sin_cache.to(dtype)
+    half = cache.shape[-1] // 2
+    return cache[:, :half], cache[:, half:]
+
+
+def rocm_aiter_indexer_qk_rope_quant_and_cache_fake(
+    k_cache_prefix: LayerNameType,
+    kv_cache: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    positions: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_bias: torch.Tensor,
+    q_fp8_out: torch.Tensor,
+    weights_out: torch.Tensor,
+    epsilon: float,
+    quant_block_size: int,
+    scale_fmt: str,
+    weights_scale: float,
+    zero_outputs: bool,
+    is_neox: bool,
+) -> None:
+    return None
+
+
+def rocm_aiter_indexer_qk_rope_quant_and_cache(
+    k_cache_prefix: LayerNameType,
+    kv_cache: torch.Tensor,
+    q: torch.Tensor,  # [num_tokens, n_heads, head_dim], raw post-wq_b
+    k: torch.Tensor,  # [num_tokens, head_dim], raw pre-norm/rope
+    weights: torch.Tensor,  # [num_tokens, n_heads], raw post-weights_proj
+    positions: torch.Tensor,  # [num_tokens]
+    cos: torch.Tensor,  # [max_position, rope_dim // 2]
+    sin: torch.Tensor,  # [max_position, rope_dim // 2]
+    norm_weight: torch.Tensor,  # [head_dim], q dtype
+    norm_bias: torch.Tensor,  # [head_dim], q dtype
+    q_fp8_out: torch.Tensor,  # [>= num_tokens, n_heads, head_dim] fp8, written
+    weights_out: torch.Tensor,  # [>= num_tokens, n_heads] fp32, written
+    epsilon: float,
+    quant_block_size: int,
+    scale_fmt: str,
+    weights_scale: float,
+    zero_outputs: bool,
+    is_neox: bool,
+) -> None:
+    """Run aiter's fused DSA indexer QK kernel into the caller's buffers.
+
+    One launch of ``aiter.indexer_qk_rope_quant_and_cache`` covers RoPE on the
+    leading rope dims of q and k, LayerNorm on k, per-group FP8 quantization
+    of both, the q scale folded into ``weights_out``, and the paged indexer
+    K-cache write — replacing the unfused rope / layernorm / quant / pointwise
+    / cache-write launches of the baseline indexer path.
+    """
+    from aiter import indexer_qk_rope_quant_and_cache
+
+    attn_metadata = get_forward_context().attn_metadata
+    # Profiling / dummy run: no slot_mapping, so no cache write and nothing to
+    # fill — the caller's output buffers are already correctly shaped, which
+    # is all tracing and memory profiling need.
+    if not isinstance(attn_metadata, dict):
+        return
+    from vllm.utils.torch_utils import _resolve_layer_name
+
+    k_cache_prefix = _resolve_layer_name(k_cache_prefix)
+    layer_attn_metadata = attn_metadata[k_cache_prefix]
+    assert isinstance(layer_attn_metadata, DeepseekV32IndexerMetadata)
+    slot_mapping = layer_attn_metadata.slot_mapping
+    num_tokens = slot_mapping.shape[0]
+
+    # The outputs cover one row per input token, CUDA-graph padding included:
+    # the decode path reads weights[:batch_size * next_n], which can exceed
+    # num_tokens. Rows the kernel leaves unwritten (padding, and rows whose
+    # slot_mapping is negative) must read as zero so the padded logits they
+    # feed stay finite (their top-k results are discarded via the -1
+    # sentinels). Only a pass's first indexer zeroes a shared buffer pair; a
+    # per-layer pair arrives already zeroed. Slice here rather than in the
+    # caller so the mutated op arguments stay the base tensors, not views.
+    total = q.shape[0]
+    # The kernel walks slot_mapping and indexes q/k/weights by the same row, so
+    # more slots than query rows would read past their ends.
+    assert num_tokens <= total, (
+        f"slot_mapping has {num_tokens} rows but only {total} query rows"
+    )
+    q_fp8_out = q_fp8_out[:total]
+    weights_out = weights_out[:total]
+    if zero_outputs:
+        q_fp8_out.zero_()
+        weights_out.zero_()
+    indexer_qk_rope_quant_and_cache(
+        q[:num_tokens],
+        q_fp8_out[:num_tokens],
+        weights[:num_tokens],
+        weights_out[:num_tokens],
+        k[:num_tokens],
+        kv_cache,
+        slot_mapping,
+        norm_weight,
+        norm_bias,
+        positions[:num_tokens],
+        cos,
+        sin,
+        epsilon,
+        quant_block_size,
+        scale_fmt,
+        weights_scale,
+        # Writer layout must match the readers (cp_gather prefill gather and
+        # paged-MQA decode): 16x16-tiled in-block for block_size > 1, flat
+        # otherwise — the same predicate indexer_k_quant_and_cache_triton and
+        # rocm_fp8_paged_mqa_logits use.
+        preshuffle=kv_cache.shape[1] > 1,
+        is_neox=is_neox,
+    )
+
+
 def _decode_e8m0_scales(scale: torch.Tensor) -> torch.Tensor:
     if scale.dtype == torch.float8_e8m0fnu:
         from vllm.model_executor.layers.quantization.utils.fp8_utils import (

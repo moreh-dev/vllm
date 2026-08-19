@@ -143,6 +143,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_MLA: bool = True
     VLLM_ROCM_AITER_MLA_ASM_PADDING: Literal["auto", "gluon", "asm"] = "auto"
     VLLM_ROCM_USE_AITER_MHA: bool = True
+    VLLM_ROCM_USE_AITER_INDEXER_QK_FUSION: bool = False
     VLLM_ROCM_USE_AITER_FP4_ASM_GEMM: bool = False
     VLLM_ROCM_USE_AITER_TRITON_ROPE: bool = False
     VLLM_ROCM_USE_AITER_FP8BMM: bool = True
@@ -1302,6 +1303,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_MHA": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_MHA", "True").lower() in ("true", "1")
+    ),
+    # Whether to use the aiter fused indexer QK kernel
+    # (indexer_qk_rope_quant_and_cache) on DeepSeek sparse attention (DSA)
+    # models such as DeepSeek-V3.2 and GLM-5.x: fuses the indexer's Q/K RoPE,
+    # K LayerNorm, per-group FP8 quantization and indexer K-cache write into
+    # a single kernel launch. Requires VLLM_ROCM_USE_AITER=1 and the
+    # rotary_embedding custom op (the in-place RoPE indexer path).
+    # By default is disabled.
+    "VLLM_ROCM_USE_AITER_INDEXER_QK_FUSION": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_INDEXER_QK_FUSION", "False").lower()
+        in ("true", "1")
     ),
     # Whether to use aiter fp4 gemm asm.
     # By default is disabled.
