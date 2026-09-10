@@ -34,7 +34,7 @@ else:
 # ~5x wall-clock speedup vs the baseline replicated Indexer on TP=8.
 # Tuned on MI300X TP=8 M=32768: 512 is the crossover between work-balance
 # gains and kernel-launch overhead.
-_STRIPE_SIZE = 512
+_STRIPE_SIZE = envs.VLLM_ROCM_USE_AITER_CP_INDEXER_STRIPE_SIZE
 
 @functools.cache
 def _get_aiter_topk_ops() -> tuple[Callable[..., None], Callable[..., None]] | None:
@@ -962,7 +962,7 @@ def rocm_aiter_sparse_attn_indexer(
             )
 
             chunk_m = chunk.token_end - chunk.token_start
-            if tp_world_size > 1 and chunk_m >= tp_world_size:
+            if envs.VLLM_ROCM_USE_AITER_CP_INDEXER and tp_world_size > 1 and chunk_m >= tp_world_size:
                 # Interleaved M-split: each rank takes stripes of size
                 # _STRIPE_SIZE across the full M range.  Distributes causal
                 # work evenly (rank 0 gets cheap early rows, rank 7 gets
@@ -1059,7 +1059,7 @@ def rocm_aiter_sparse_attn_indexer(
                     )
 
             # AllReduce(MAX): unwritten positions = -1, MAX recovers full result
-            if tp_world_size > 1:
+            if envs.VLLM_ROCM_USE_AITER_CP_INDEXER and tp_world_size > 1:
                 prefill_start = num_decode_tokens
                 prefill_end = hidden_states.shape[0]
                 buf_slice = topk_indices_buffer[
