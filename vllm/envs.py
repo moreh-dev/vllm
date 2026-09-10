@@ -1324,7 +1324,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         case_sensitive=False,
     ),
     "VLLM_ROCM_USE_AITER_CP_INDEXER": lambda: (
-        os.getenv("VLLM_ROCM_USE_AITER_CP_INDEXER", "True").lower() in ("true", "1")
+        os.getenv("VLLM_ROCM_USE_AITER_CP_INDEXER", "False").lower() in ("true", "1")
     ),
     "VLLM_ROCM_USE_AITER_CP_INDEXER_STRIPE_SIZE": lambda: int(
         os.getenv("VLLM_ROCM_USE_AITER_CP_INDEXER_STRIPE_SIZE", "512")
