@@ -1058,25 +1058,25 @@ def rocm_aiter_sparse_attn_indexer(
                         topk_tokens,
                     )
 
-            # AllReduce(MAX): unwritten positions = -1, MAX recovers full result
-            if envs.VLLM_ROCM_USE_AITER_CP_INDEXER and tp_world_size > 1:
-                prefill_start = num_decode_tokens
-                prefill_end = hidden_states.shape[0]
-                buf_slice = topk_indices_buffer[
-                    prefill_start:prefill_end, :topk_tokens
-                ]
-                if buf_slice.is_contiguous():
-                    dist.all_reduce(
-                        buf_slice, op=dist.ReduceOp.MAX,
-                        group=tp_group.device_group,
-                    )
-                else:
-                    tmp = buf_slice.contiguous()
-                    dist.all_reduce(
-                        tmp, op=dist.ReduceOp.MAX,
-                        group=tp_group.device_group,
-                    )
-                    buf_slice.copy_(tmp)
+        # AllReduce(MAX): unwritten positions = -1, MAX recovers full result
+        if envs.VLLM_ROCM_USE_AITER_CP_INDEXER and tp_world_size > 1:
+            prefill_start = num_decode_tokens
+            prefill_end = hidden_states.shape[0]
+            buf_slice = topk_indices_buffer[
+                prefill_start:prefill_end, :topk_tokens
+            ]
+            if buf_slice.is_contiguous():
+                dist.all_reduce(
+                    buf_slice, op=dist.ReduceOp.MAX,
+                    group=tp_group.device_group,
+                )
+            else:
+                tmp = buf_slice.contiguous()
+                dist.all_reduce(
+                    tmp, op=dist.ReduceOp.MAX,
+                    group=tp_group.device_group,
+                )
+                buf_slice.copy_(tmp)
 
     if has_decode:
         decode_metadata = layer_attn_metadata.decode
