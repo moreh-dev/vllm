@@ -35,6 +35,7 @@ from .deepseek_v2 import (
     DeepseekV2DecoderLayer,
     DeepseekV2MixtureOfExperts,
     DeepseekV2MoE,
+    IndexerQKFusionBuffers,
     _try_load_fp8_indexer_wk,
 )
 from .utils import (
@@ -88,8 +89,14 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
                 dtype=torch.int32,
                 device=self.device,
             )
+            # Each MTP layer is its own buffer root: it always re-zeros its
+            # pair instead of inheriting the target model's unwritten rows.
+            indexer_qk_fusion_buffers = IndexerQKFusionBuffers.maybe_build(
+                vllm_config, config, self.device
+            )
         else:
             topk_indices_buffer = None
+            indexer_qk_fusion_buffers = None
 
         self.shared_head = SharedHead(
             config=config, prefix=prefix, quant_config=quant_config
@@ -99,6 +106,7 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
             prefix,
             config=self.config,
             topk_indices_buffer=topk_indices_buffer,
+            indexer_qk_fusion_buffers=indexer_qk_fusion_buffers,
         )
 
     def forward(
