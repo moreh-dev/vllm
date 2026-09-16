@@ -470,6 +470,7 @@ class DeepseekV2Attention(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
+        indexer_qk_fusion_buffers: "IndexerQKFusionBuffers | None" = None,
         reduce_results: bool = True,
         prefix: str = "",
     ) -> None:
@@ -490,6 +491,9 @@ class DeepseekV2Attention(nn.Module):
         assert topk_indices_buffer is None, (
             "topk_indices_buffer is not \
         supported for DeepseekV2Attention"
+        )
+        assert indexer_qk_fusion_buffers is None, (
+            "indexer_qk_fusion_buffers is not supported for DeepseekV2Attention"
         )
 
         if self.q_lora_rank is not None:
@@ -672,6 +676,69 @@ class DeepseekV32IndexerCache(torch.nn.Module, AttentionLayerBase):
         return DeepseekV32IndexerBackend
 
 
+class IndexerQKFusionBuffers:
+    """Model-shared q_fp8/weights output pair for the fused indexer QK kernel.
+
+    Allocated next to ``topk_indices_buffer`` and sized the same way, so the
+    address is stable before CUDA-graph capture and no indexer layer allocates
+    per step. The fused kernel skips rows whose slot is ``PAD_SLOT_ID`` and
+    never touches rows past ``slot_mapping``, yet decode reads
+    ``weights[:batch_size * next_n]``, which covers those rows: they must read
+    as zero. Which rows stay unwritten depends only on ``slot_mapping``, which
+    every layer of a pass shares, so the first indexer to run under a root
+    clears the pair once per pass and the other layers just write into it.
+    """
+
+    def __init__(
+        self, capacity: int, n_heads: int, head_dim: int, device: torch.device
+    ):
+        # Zero-init is load-bearing: rows the kernel skips must read as zero.
+        self.q_fp8 = torch.zeros(
+            (capacity, n_heads, head_dim),
+            dtype=current_platform.fp8_dtype(),
+            device=device,
+        )
+        self.weights = torch.zeros(
+            (capacity, n_heads), dtype=torch.float32, device=device
+        )
+        self._zero_fill_owner: int | None = None
+
+    @classmethod
+    def maybe_build(
+        cls,
+        vllm_config: VllmConfig,
+        config: DeepseekV2Config | DeepseekV3Config,
+        device: torch.device,
+    ) -> "IndexerQKFusionBuffers | None":
+        if not Indexer.can_use_aiter_qk_fusion(vllm_config, config):
+            return None
+        return cls(
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            config.index_n_heads,
+            config.index_head_dim,
+            device,
+        )
+
+    def claim_zero_fill(self, layer_index: int) -> bool:
+        """True only for the first caller, which owns the per-pass zero-fill.
+
+        The claimer must also be the first indexer to run under this root, or
+        the rows the kernel skips would keep the previous pass's values. Layers
+        that skip the indexer build none (`_skip_topk` above), so construction
+        order is execution order; assert it, because the runtime toggle at
+        mla.py `not self.skip_topk` could break that in the future.
+        """
+        if self._zero_fill_owner is None:
+            self._zero_fill_owner = layer_index
+            return True
+        assert layer_index > self._zero_fill_owner, (
+            f"indexer at layer {layer_index} was built after the zero-fill "
+            f"owner at layer {self._zero_fill_owner}, so the owner may not run "
+            "first"
+        )
+        return False
+
+
 class Indexer(nn.Module):
     def __init__(
         self,
@@ -684,6 +751,7 @@ class Indexer(nn.Module):
         topk_indices_buffer: torch.Tensor | None,
         prefix: str = "",
         is_inplace_rope: bool = False,
+        indexer_qk_fusion_buffers: IndexerQKFusionBuffers | None = None,
     ):
         super().__init__()
         self.vllm_config = vllm_config
@@ -745,16 +813,19 @@ class Indexer(nn.Module):
             and self.rope_dim == 64
             and self.scale_fmt is not None
         )
-        # Static: it selects skip_k_cache_insert, and nothing else writes the cache.
+        # Static: it selects skip_k_cache_insert, and nothing else writes the
+        # cache. One predicate decides both the writer and the skip so they
+        # cannot disagree.
         self.use_fused_indexer_qk = (
-            rocm_aiter_ops.is_enabled()
-            and aiter_indexer_qk_fused_kernel() is not None
-            and vllm_config.model_config.dtype == torch.bfloat16
+            self.can_use_aiter_qk_fusion(vllm_config, config)
             and self.quant_block_size == self.head_dim
-            and self.head_dim == 128
-            and self.rope_dim == 64
             and self.scale_fmt == "ue8m0"
         )
+        if self.use_fused_indexer_qk:
+            logger.info_once(
+                "Fusing the DSA indexer prologue into "
+                "aiter.indexer_qk_rope_quant_and_cache"
+            )
 
         self.indexer_op = SparseAttnIndexer(
             self.k_cache,
@@ -767,6 +838,47 @@ class Indexer(nn.Module):
             self.topk_indices_buffer,
             skip_k_cache_insert=self.use_fused_indexer_qk,
         )
+        self.indexer_qk_fusion_buffers = (
+            indexer_qk_fusion_buffers if self.use_fused_indexer_qk else None
+        )
+        self.owns_qk_fusion_zero_fill = (
+            self.indexer_qk_fusion_buffers is not None
+            and self.indexer_qk_fusion_buffers.claim_zero_fill(
+                extract_layer_index(prefix)
+            )
+        )
+
+    @staticmethod
+    def can_use_aiter_qk_fusion(
+        vllm_config: VllmConfig,
+        config: DeepseekV2Config | DeepseekV3Config,
+    ) -> bool:
+        """Whether the AITER fused indexer QK kernel serves this model.
+
+        The kernel is built for the DSA shapes (head_dim 128, rope_dim 64) in
+        BF16 and ships in AITER's CK build for gfx942/gfx950 only.
+
+        Context parallel stays unfused: ``slot_mapping`` is ``PAD_SLOT_ID`` on
+        ranks that do not own a token, so the kernel would skip the row and
+        never write its query, which every rank needs to score its KV shard.
+        (AITER >= v0.1.21 exposes ``compute_all_q_rope`` for exactly this; wire
+        it once the CP indexer path is validated on the fused kernel.)
+        """
+        if not current_platform.is_rocm():
+            return False
+        from vllm.platforms.rocm import on_mi3xx
+
+        parallel_config = vllm_config.parallel_config
+        return bool(
+            rocm_aiter_ops.is_indexer_qk_fusion_enabled()
+            and on_mi3xx()
+            and aiter_indexer_qk_fused_kernel() is not None
+            and vllm_config.model_config.dtype == torch.bfloat16
+            and getattr(config, "index_head_dim", None) == 128
+            and getattr(config, "qk_rope_head_dim", None) == 64
+            and parallel_config.decode_context_parallel_size == 1
+            and parallel_config.prefill_context_parallel_size == 1
+        )
 
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
@@ -775,26 +887,53 @@ class Indexer(nn.Module):
         q = q.view(-1, self.n_head, self.head_dim)
 
         if self.use_fused_indexer_qk:
+            # One GEMM, then split; the kernel reads both through their strides.
             kw, _ = self.wk_weights_proj(hidden_states)
 
-            q_fp8, weights = torch.ops.vllm.rocm_aiter_indexer_qk_rope_quant_cache(
+            # Model-shared pair when one was handed down, a fresh zeroed pair
+            # otherwise; an init-time constant, so each layer traces one branch.
+            total = q.shape[0]
+            if self.indexer_qk_fusion_buffers is not None:
+                q_fp8 = self.indexer_qk_fusion_buffers.q_fp8
+                weights_out = self.indexer_qk_fusion_buffers.weights
+                zero_outputs = self.owns_qk_fusion_zero_fill
+            else:
+                q_fp8 = torch.zeros(
+                    (total, self.n_head, self.head_dim),
+                    dtype=current_platform.fp8_dtype(),
+                    device=q.device,
+                )
+                weights_out = torch.zeros(
+                    (total, self.n_head), dtype=torch.float32, device=q.device
+                )
+                zero_outputs = False
+
+            torch.ops.vllm.rocm_aiter_indexer_qk_rope_quant_cache(
                 q,
                 kw[:, : self.head_dim],
                 kw[:, self.head_dim :],
                 positions,
                 self.k_cache.kv_cache,
                 _encode_layer_name(self.k_cache.prefix),
+                # The AITER kernel reads the LayerNorm params in fp32, which is
+                # how vLLM's LayerNorm stores them.
                 self.k_norm.weight,
                 self.k_norm.bias,
                 rotary_emb.cos_sin_cache,
+                q_fp8,
+                weights_out,
                 self.k_norm.eps,
                 self.quant_block_size,
                 self.scale_fmt,
                 self.softmax_scale * self.n_head_scale,
+                zero_outputs,
                 rotary_emb.is_neox_style,
             )
-            # k is None: indexer_op was built with skip_k_cache_insert=True.
-            return self.indexer_op(hidden_states, q_fp8, None, weights)
+            # K cache already written: indexer_op was built with
+            # skip_k_cache_insert=True, so k is None.
+            return self.indexer_op(
+                hidden_states, q_fp8[:total], None, weights_out[:total]
+            )
         elif current_platform.is_rocm() and self.is_inplace_rope:
             # This path should works on all platform, will remove extra
             # branches in the future
@@ -1054,6 +1193,7 @@ class DeepseekV2MLAAttention(nn.Module):
         prefix: str = "",
         topk_indices_buffer: torch.Tensor | None = None,
         index_group_builder: SparseMLAIndexGroupBuilder | None = None,
+        indexer_qk_fusion_buffers: IndexerQKFusionBuffers | None = None,
         input_size: int | None = None,
         reduce_results: bool = True,
         non_causal_multi_token_decode: bool = False,
@@ -1218,6 +1358,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 topk_indices_buffer,
                 f"{prefix}.indexer",
                 is_inplace_rope=self.indexer_rope_emb.enabled(),
+                indexer_qk_fusion_buffers=indexer_qk_fusion_buffers,
             )
         else:
             self.indexer_rope_emb = None
@@ -1286,6 +1427,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         config: DeepseekV2Config | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
         index_group_builder: SparseMLAIndexGroupBuilder | None = None,
+        indexer_qk_fusion_buffers: IndexerQKFusionBuffers | None = None,
     ) -> None:
         super().__init__()
 
@@ -1335,7 +1477,10 @@ class DeepseekV2DecoderLayer(nn.Module):
             and is_moe_layer
         )
         attn_kwargs = (
-            {"index_group_builder": index_group_builder}
+            {
+                "index_group_builder": index_group_builder,
+                "indexer_qk_fusion_buffers": indexer_qk_fusion_buffers,
+            }
             if attn_cls is DeepseekV2MLAAttention
             else {}
         )
@@ -1477,8 +1622,12 @@ class DeepseekV2Model(nn.Module):
                 dtype=torch.int32,
                 device=self.device,
             )
+            indexer_qk_fusion_buffers = IndexerQKFusionBuffers.maybe_build(
+                vllm_config, config, self.device
+            )
         else:
             topk_indices_buffer = None
+            indexer_qk_fusion_buffers = None
         index_group_builder = (
             SparseMLAIndexGroupBuilder(
                 topk_indices_buffer,
@@ -1504,6 +1653,7 @@ class DeepseekV2Model(nn.Module):
                 prefix=prefix,
                 topk_indices_buffer=topk_indices_buffer,
                 index_group_builder=index_group_builder,
+                indexer_qk_fusion_buffers=indexer_qk_fusion_buffers,
             ),
             prefix=f"{prefix}.layers",
         )

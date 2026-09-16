@@ -142,6 +142,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_MLA: bool = True
     VLLM_ROCM_AITER_MLA_ASM_PADDING: Literal["auto", "gluon", "asm"] = "auto"
     VLLM_ROCM_USE_AITER_MHA: bool = True
+    VLLM_ROCM_USE_AITER_INDEXER_QK_FUSION: bool = True
     VLLM_ROCM_USE_AITER_TRITON_ROPE: bool = False
     VLLM_ROCM_USE_AITER_FP8BMM: bool = True
     VLLM_ROCM_USE_AITER_FP4BMM: bool = True
@@ -1296,6 +1297,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_MHA": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_MHA", "True").lower() in ("true", "1")
+    ),
+    # Whether to run the DeepSeek sparse attention (DSA) indexer prologue
+    # (K LayerNorm, Q/K RoPE, FP8 quantization, indexer K-cache write) through
+    # AITER's fused indexer_qk_rope_quant_and_cache kernel on gfx942/gfx950.
+    # Needs VLLM_ROCM_USE_AITER=1. A kill switch: enabled by default.
+    "VLLM_ROCM_USE_AITER_INDEXER_QK_FUSION": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_INDEXER_QK_FUSION", "True").lower()
+        in ("true", "1")
     ),
     # Whether to use aiter rope.
     # By default is disabled.

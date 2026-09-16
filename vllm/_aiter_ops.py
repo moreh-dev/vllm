@@ -1746,6 +1746,50 @@ def _mhc_delayed_pre_tail(
     return post_mix, comb_mix, layer_input, next_pre_mix
 
 
+@functools.lru_cache
+def _aiter_indexer_qk_fusion_norm_params_fp32() -> bool:
+    """Whether this AITER's ``indexer_qk_rope_quant_and_cache`` wants fp32 norms.
+
+    AITER v0.1.19 reads the indexer LayerNorm weight/bias in q's dtype;
+    v0.1.19.post1 and later require fp32. The check is an ``AITER_CHECK`` that
+    aborts the process, so the contract has to be known up front. The compiled
+    module carries it as the check message, which also covers patched source
+    builds whose version string says nothing about the ABI; the version is the
+    fallback.
+    """
+    try:
+        from aiter.jit.core import get_module, get_user_jit_dir
+
+        get_module("module_cache")  # builds the module if it is JIT-only
+        so_path = os.path.join(get_user_jit_dir(), "module_cache.so")
+        with open(so_path, "rb") as f:
+            text = f.read()
+        if b"norm_weight dtype must match q dtype" in text:
+            return False
+        if b"norm_weight dtype must be fp32" in text:
+            return True
+    except Exception:  # noqa: BLE001 - fall through to the version check
+        pass
+    try:
+        from aiter._version import __version__ as aiter_version
+        from packaging.version import Version
+
+        return Version(aiter_version) >= Version("0.1.19.post1")
+    except Exception:  # noqa: BLE001 - unknown build: assume the current ABI
+        return True
+
+
+def aiter_indexer_qk_fusion_norm_dtype(reference_dtype: torch.dtype) -> torch.dtype:
+    """dtype the fused indexer kernel expects its LayerNorm params in.
+
+    ``reference_dtype`` is q's dtype, which the pre-``v0.1.19.post1`` kernels
+    read the params in.
+    """
+    if _aiter_indexer_qk_fusion_norm_params_fp32():
+        return torch.float32
+    return reference_dtype
+
+
 def _rocm_aiter_indexer_qk_rope_quant_cache_impl(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1756,44 +1800,72 @@ def _rocm_aiter_indexer_qk_rope_quant_cache_impl(
     k_norm_weight: torch.Tensor,
     k_norm_bias: torch.Tensor,
     cos_sin_cache: torch.Tensor,
+    q_fp8_out: torch.Tensor,
+    weights_out: torch.Tensor,
     k_norm_eps: float,
     quant_block_size: int,
     scale_fmt: str,
     weights_scale: float,
+    zero_outputs: bool,
     is_neox: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Whole sparse indexer prologue in one AITER launch; writes the K cache."""
+) -> None:
+    """Whole sparse indexer prologue in one AITER launch; writes the K cache.
+
+    Writes into the caller's ``q_fp8_out`` / ``weights_out`` so the outputs can
+    be model-shared, CUDA-graph-stable buffers. The kernel only touches rows
+    whose ``slot_mapping`` entry is valid and never reads past ``slot_mapping``:
+    CUDA-graph padding rows (``PAD_SLOT_ID``) and rows past the indexed tokens
+    keep whatever the buffers held. Decode reads ``weights[:batch * next_n]``,
+    which covers those rows, so they must read as zero for the padded logits
+    they feed to stay finite: ``zero_outputs`` clears both buffers first, and
+    the caller sets it on exactly one indexer per forward pass (every layer of a
+    pass shares one ``slot_mapping``, so one clear serves them all).
+    """
     from aiter import indexer_qk_rope_quant_and_cache
 
     from vllm.utils.torch_utils import _resolve_layer_name
     from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 
-    q_out = torch.empty(q.shape, dtype=FP8_DTYPE, device=q.device)
-    weights_out = torch.empty(weights.shape, dtype=torch.float32, device=weights.device)
+    if zero_outputs:
+        q_fp8_out.zero_()
+        weights_out.zero_()
 
     attn_metadata = get_forward_context().attn_metadata
     if not isinstance(attn_metadata, dict):
-        # Profiling / dummy run: no slot mapping yet.
-        q_out.zero_()
-        weights_out.zero_()
-        return q_out, weights_out
+        # Profiling / dummy run: no slot mapping, so nothing to write. The
+        # caller's buffers are already shaped, which is all tracing needs.
+        return
 
     layer_attn_metadata = attn_metadata[_resolve_layer_name(k_cache_prefix)]
     assert isinstance(layer_attn_metadata, DeepseekV32IndexerMetadata)
+    slot_mapping = layer_attn_metadata.slot_mapping
+
+    # The kernel indexes q/k/weights and both outputs by slot_mapping row.
+    num_tokens = slot_mapping.shape[0]
+    assert num_tokens <= q.shape[0], (
+        f"slot_mapping has {num_tokens} rows but only {q.shape[0]} query rows"
+    )
+    assert q_fp8_out.shape[0] >= q.shape[0] and weights_out.shape[0] >= q.shape[0], (
+        "fused indexer output buffers are smaller than the query batch"
+    )
 
     # AITER takes cos and sin separately; vLLM packs both halves in one table.
     rope_half = cos_sin_cache.shape[-1] // 2
 
+    # vLLM's LayerNorm keeps fp32 params, which is what AITER >= v0.1.19.post1
+    # reads (a no-op cast there); v0.1.19 reads them in q's dtype.
+    norm_dtype = aiter_indexer_qk_fusion_norm_dtype(q.dtype)
+
     indexer_qk_rope_quant_and_cache(
         q,
-        q_out,
+        q_fp8_out,
         weights,
         weights_out,
         k,
         kv_cache,
-        layer_attn_metadata.slot_mapping,
-        k_norm_weight,
-        k_norm_bias,
+        slot_mapping,
+        k_norm_weight.to(norm_dtype),
+        k_norm_bias.to(norm_dtype),
         positions,
         cos_sin_cache[:, :rope_half],
         cos_sin_cache[:, rope_half:],
@@ -1804,7 +1876,6 @@ def _rocm_aiter_indexer_qk_rope_quant_cache_impl(
         kv_cache.shape[1] > 1,
         is_neox,
     )
-    return q_out, weights_out
 
 
 def _rocm_aiter_indexer_qk_rope_quant_cache_fake(
@@ -1817,16 +1888,16 @@ def _rocm_aiter_indexer_qk_rope_quant_cache_fake(
     k_norm_weight: torch.Tensor,
     k_norm_bias: torch.Tensor,
     cos_sin_cache: torch.Tensor,
+    q_fp8_out: torch.Tensor,
+    weights_out: torch.Tensor,
     k_norm_eps: float,
     quant_block_size: int,
     scale_fmt: str,
     weights_scale: float,
+    zero_outputs: bool,
     is_neox: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return (
-        torch.empty(q.shape, dtype=FP8_DTYPE, device=q.device),
-        torch.empty(weights.shape, dtype=torch.float32, device=weights.device),
-    )
+) -> None:
+    return None
 
 
 # Global flag to ensure ops are registered only once
@@ -1913,6 +1984,7 @@ class rocm_aiter_ops:
     _FMOE_ENABLED = envs.VLLM_ROCM_USE_AITER_MOE
     _MLA_ENABLED = envs.VLLM_ROCM_USE_AITER_MLA
     _MHA_ENABLED = envs.VLLM_ROCM_USE_AITER_MHA
+    _INDEXER_QK_FUSION_ENABLED = envs.VLLM_ROCM_USE_AITER_INDEXER_QK_FUSION
     _SHUFFLE_KV_CACHE_ENABLED = envs.VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT
     _TRITON_UNIFIED_ATTN_ENABLED = envs.VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION
     # TODO: Consolidate under _LINEAR_ENABLED
@@ -1944,6 +2016,7 @@ class rocm_aiter_ops:
         cls._FMOE_ENABLED = envs.VLLM_ROCM_USE_AITER_MOE
         cls._MLA_ENABLED = envs.VLLM_ROCM_USE_AITER_MLA
         cls._MHA_ENABLED = envs.VLLM_ROCM_USE_AITER_MHA
+        cls._INDEXER_QK_FUSION_ENABLED = envs.VLLM_ROCM_USE_AITER_INDEXER_QK_FUSION
         cls._SHUFFLE_KV_CACHE_ENABLED = envs.VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT
         cls._TRITON_UNIFIED_ATTN_ENABLED = envs.VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION
         cls._FP8BMM_ENABLED = envs.VLLM_ROCM_USE_AITER_FP8BMM
@@ -2124,6 +2197,11 @@ class rocm_aiter_ops:
     @if_aiter_supported
     def is_mha_enabled(cls) -> bool:
         return cls._AITER_ENABLED and cls._MHA_ENABLED
+
+    @classmethod
+    @if_aiter_supported
+    def is_indexer_qk_fusion_enabled(cls) -> bool:
+        return cls._AITER_ENABLED and cls._INDEXER_QK_FUSION_ENABLED
 
     @classmethod
     @if_aiter_supported
@@ -2490,7 +2568,7 @@ class rocm_aiter_ops:
             direct_register_custom_op(
                 op_name="rocm_aiter_indexer_qk_rope_quant_cache",
                 op_func=_rocm_aiter_indexer_qk_rope_quant_cache_impl,
-                mutates_args=["kv_cache"],
+                mutates_args=["kv_cache", "q_fp8_out", "weights_out"],
                 fake_impl=_rocm_aiter_indexer_qk_rope_quant_cache_fake,
                 dispatch_key=current_platform.dispatch_key,
             )
