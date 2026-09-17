@@ -1353,6 +1353,7 @@ def unified_mla_attention_with_output_fake(
     quant_col_major: bool | None = None,
     quant_tma_aligned: bool | None = None,
     q_dcp_replicated: torch.Tensor | None = None,
+    positions: torch.Tensor | None = None,
 ) -> None:
     return
 
