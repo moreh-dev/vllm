@@ -134,6 +134,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER: bool = False
     VLLM_ROCM_USE_AITER_CP_INDEXER: bool = False
     VLLM_ROCM_USE_AITER_CP_INDEXER_STRIPE_SIZE: int = 512
+    VLLM_ROCM_USE_AITER_HIP_MQA_LOGITS: bool = True
     VLLM_ROCM_USE_AITER_CUSTOM_AR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
@@ -1311,6 +1312,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_ROCM_USE_AITER_CP_INDEXER_STRIPE_SIZE": lambda: int(
         os.getenv("VLLM_ROCM_USE_AITER_CP_INDEXER_STRIPE_SIZE", "512")
+    ),
+    # Use aiter's hand-written HIP prefill indexer logits kernel
+    # (aiter.ops.fp8_mqa_logits, gfx950 only) for the DSA sparse indexer instead
+    # of the Triton/gluon kernel. Falls back to Triton when the installed aiter
+    # does not provide it or the indexer shape is unsupported.
+    "VLLM_ROCM_USE_AITER_HIP_MQA_LOGITS": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_HIP_MQA_LOGITS", "True").lower() in ("true", "1")
     ),
     # Whether to use aiter mha ops.
     # By default is enabled.

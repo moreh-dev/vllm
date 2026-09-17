@@ -635,6 +635,22 @@ def mqa_logits_module():
     return None
 
 
+@functools.lru_cache
+def _hip_mqa_logits_module():
+    """aiter's hand-written gfx950 HIP prefill indexer logits kernel
+    (``aiter.ops.fp8_mqa_logits``, moreh-dev/rocm-aiter PR #4), or None when
+    disabled or not shipped by the installed aiter."""
+    if not envs.VLLM_ROCM_USE_AITER_HIP_MQA_LOGITS:
+        return None
+    try:
+        mod = importlib.import_module("aiter.ops.fp8_mqa_logits")
+    except ImportError:
+        return None
+    if not (hasattr(mod, "fp8_mqa_logits") and hasattr(mod, "is_supported")):
+        return None
+    return mod
+
+
 def rocm_fp8_mqa_logits(
     q: torch.Tensor,
     kv: tuple[torch.Tensor, torch.Tensor],
@@ -670,6 +686,26 @@ def rocm_fp8_mqa_logits(
         return flydsl_fp8_mqa_logits(
             q, k_fp8, scale, weights, cu_seqlen_ks, cu_seqlen_ke
         )
+
+    # gfx950: prefer aiter's HIP kernel (fixed 32 heads x 128 dims, the GLM-5 /
+    # DeepSeek-V3.2 indexer shape); other shapes fall through to Triton.
+    if _ON_GFX950 and rocm_aiter_ops.is_enabled():
+        hip = _hip_mqa_logits_module()
+        if (
+            hip is not None
+            and q.dim() == 3
+            and k_fp8.dim() == 2
+            and k_fp8.shape[1] == q.shape[2]
+            and hip.is_supported(q.shape[1], q.shape[2])
+        ):
+            return hip.fp8_mqa_logits(
+                q,
+                k_fp8,
+                scale.reshape(-1).contiguous(),
+                weights.contiguous(),
+                cu_seqlen_ks,
+                cu_seqlen_ke,
+            )
 
     aiter_mqa_logits_module = None
     if rocm_aiter_ops.is_enabled() or rocm_aiter_ops.is_rdna_aiter_enabled():
