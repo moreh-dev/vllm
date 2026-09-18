@@ -7,11 +7,13 @@ from collections.abc import Callable
 from importlib.util import find_spec
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CUDAGraphMode, get_current_vllm_config
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -28,6 +30,36 @@ else:
     _ON_GFX950 = False
 
 logger = init_logger(__name__)
+
+# Interleaved query-row stripes balance causal work across TP ranks.
+_STRIPE_SIZE = envs.VLLM_ROCM_USE_AITER_CP_INDEXER_STRIPE_SIZE
+
+
+def _m_split_stripes(
+    chunk_m: int,
+    stripe: int,
+    tp_rank: int,
+    tp_world_size: int,
+) -> list[tuple[int, int]]:
+    """List the stripes of a prefill chunk that belong to one rank.
+
+    Stripes are dealt round-robin, so each rank gets an even mix of the cheap
+    early rows and the expensive late ones, and over all ranks they tile the
+    chunk exactly once. The last stripe of the chunk may be short.
+
+    Args:
+        chunk_m: Query rows in the chunk.
+        stripe: Rows per stripe.
+        tp_rank: Rank to enumerate, within its tensor-parallel group.
+        tp_world_size: Ranks in the tensor-parallel group.
+
+    Returns:
+        ``(offset, rows)`` pairs, offsets relative to the start of the chunk.
+    """
+    return [
+        (off, min(stripe, chunk_m - off))
+        for off in range(tp_rank * stripe, chunk_m, tp_world_size * stripe)
+    ]
 
 
 @functools.cache
@@ -1100,6 +1132,20 @@ def rocm_aiter_sparse_attn_indexer(
         )
 
     if has_prefill:
+        from vllm._aiter_ops import rocm_aiter_ops
+
+        tp_group = get_tp_group()
+        tp_rank = tp_group.rank_in_group
+        tp_world_size = tp_group.world_size
+        # Candidate-block batches stay replicated: the auxiliary state they
+        # build is not covered by the Top-K-only collective below.
+        use_m_split = (
+            rocm_aiter_ops.is_cp_indexer_enabled() and candidate_blocks is None
+        )
+        # The collective spans the whole prefill range, so it is only needed if
+        # some chunk was actually striped.
+        any_m_split = False
+
         prefill_metadata = layer_attn_metadata.prefill
         assert prefill_metadata is not None
 
@@ -1119,68 +1165,147 @@ def rocm_aiter_sparse_attn_indexer(
                 chunk.cu_seq_lens,
                 token_to_seq=chunk.token_to_seq,
             )
-            logits = rocm_fp8_mqa_logits(
-                q_fp8[chunk.token_start : chunk.token_end],
-                (k_fp8, k_scale.view(torch.float32)),
-                weights[chunk.token_start : chunk.token_end],
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
-            )
-            if candidate_blocks is not None:
-                from vllm.model_executor.layers.sparse_attn_indexer import (
-                    _apply_candidate_mask,
-                    _select_candidate_blocks,
-                )
 
-                chunk_candidates = candidate_blocks[chunk.token_start : chunk.token_end]
-                if candidate_write:
-                    _select_candidate_blocks(
+            chunk_m = chunk.token_end - chunk.token_start
+            if use_m_split and tp_world_size > 1 and chunk_m >= tp_world_size:
+                # Each rank takes stripes of _STRIPE_SIZE rows across the full
+                # M range. Causal cost grows with row index, so interleaving
+                # leaves every rank ~M**2/2/tp of work rather than handing the
+                # last rank all the expensive rows.
+                any_m_split = True
+                stripe = max(1, min(_STRIPE_SIZE, chunk_m // tp_world_size))
+
+                for local_off, local_m in _m_split_stripes(
+                    chunk_m, stripe, tp_rank, tp_world_size
+                ):
+                    local_start = chunk.token_start + local_off
+                    local_end = local_start + local_m
+                    logits = rocm_fp8_mqa_logits(
+                        q_fp8[local_start:local_end],
+                        (k_fp8, k_scale.view(torch.float32)),
+                        weights[local_start:local_end],
+                        chunk.cu_seqlen_ks[local_off : local_off + local_m],
+                        chunk.cu_seqlen_ke[local_off : local_off + local_m],
+                    )
+
+                    num_rows = logits.shape[0]
+                    topk_indices = topk_indices_buffer[
+                        local_start:local_end, :topk_tokens
+                    ]
+                    aiter_topk_kernel = _get_aiter_top_k_kernel(
+                        is_prefill=True,
+                        compress_ratio=compress_ratio,
+                        num_rows=num_rows,
+                    )
+                    if aiter_topk_kernel is not None:
+                        _launch_aiter_top_k_per_row_prefill(
+                            aiter_topk_kernel,
+                            logits,
+                            chunk.cu_seqlen_ks[local_off : local_off + local_m],
+                            chunk.cu_seqlen_ke[local_off : local_off + local_m],
+                            topk_indices,
+                            topk_tokens,
+                        )
+                    else:
+                        torch.ops._C.top_k_per_row_prefill(
+                            logits,
+                            chunk.cu_seqlen_ks[local_off : local_off + local_m],
+                            chunk.cu_seqlen_ke[local_off : local_off + local_m],
+                            topk_indices,
+                            num_rows,
+                            logits.stride(0),
+                            logits.stride(1),
+                            topk_tokens,
+                        )
+            else:
+                logits = rocm_fp8_mqa_logits(
+                    q_fp8[chunk.token_start : chunk.token_end],
+                    (k_fp8, k_scale.view(torch.float32)),
+                    weights[chunk.token_start : chunk.token_end],
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                )
+                if candidate_blocks is not None:
+                    from vllm.model_executor.layers.sparse_attn_indexer import (
+                        _apply_candidate_mask,
+                        _select_candidate_blocks,
+                    )
+
+                    chunk_candidates = candidate_blocks[
+                        chunk.token_start : chunk.token_end
+                    ]
+                    if candidate_write:
+                        _select_candidate_blocks(
+                            logits,
+                            chunk.cu_seqlen_ks,
+                            chunk.cu_seqlen_ke,
+                            chunk_candidates.shape[1],
+                            candidate_block_size,
+                            chunk_candidates,
+                        )
+                    else:
+                        _apply_candidate_mask(
+                            logits,
+                            chunk.cu_seqlen_ks,
+                            chunk.cu_seqlen_ke,
+                            chunk_candidates,
+                            candidate_block_size,
+                        )
+                topk_indices = topk_indices_buffer[
+                    chunk.token_start : chunk.token_end, :topk_tokens
+                ]
+
+                num_rows = logits.shape[0]
+
+                aiter_topk_kernel = _get_aiter_top_k_kernel(
+                    is_prefill=True,
+                    compress_ratio=compress_ratio,
+                    num_rows=num_rows,
+                )
+                if aiter_topk_kernel is not None:
+                    _launch_aiter_top_k_per_row_prefill(
+                        aiter_topk_kernel,
                         logits,
                         chunk.cu_seqlen_ks,
                         chunk.cu_seqlen_ke,
-                        chunk_candidates.shape[1],
-                        candidate_block_size,
-                        chunk_candidates,
+                        topk_indices,
+                        topk_tokens,
                     )
                 else:
-                    _apply_candidate_mask(
+                    torch.ops._C.top_k_per_row_prefill(
                         logits,
                         chunk.cu_seqlen_ks,
                         chunk.cu_seqlen_ke,
-                        chunk_candidates,
-                        candidate_block_size,
+                        topk_indices,
+                        num_rows,
+                        logits.stride(0),
+                        logits.stride(1),
+                        topk_tokens,
                     )
-            topk_indices = topk_indices_buffer[
-                chunk.token_start : chunk.token_end, :topk_tokens
-            ]
 
-            num_rows = logits.shape[0]
-
-            aiter_topk_kernel = _get_aiter_top_k_kernel(
-                is_prefill=True,
-                compress_ratio=compress_ratio,
-                num_rows=num_rows,
-            )
-            if aiter_topk_kernel is not None:
-                _launch_aiter_top_k_per_row_prefill(
-                    aiter_topk_kernel,
-                    logits,
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
-                    topk_indices,
-                    topk_tokens,
+        # One collective covers the whole prefill range, so it is guarded on
+        # whether any chunk split rather than on a single chunk's size. Rows a
+        # rank did not own are still -1 from the reset above, and rows from
+        # chunks that stayed replicated hold the same value on every rank, so
+        # MAX reassembles the batch and is idempotent on the unsplit parts.
+        if any_m_split:
+            prefill_start = num_decode_tokens
+            prefill_end = hidden_states.shape[0]
+            buf_slice = topk_indices_buffer[prefill_start:prefill_end, :topk_tokens]
+            if buf_slice.is_contiguous():
+                dist.all_reduce(
+                    buf_slice,
+                    op=dist.ReduceOp.MAX,
+                    group=tp_group.device_group,
                 )
             else:
-                torch.ops._C.top_k_per_row_prefill(
-                    logits,
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
-                    topk_indices,
-                    num_rows,
-                    logits.stride(0),
-                    logits.stride(1),
-                    topk_tokens,
+                tmp = buf_slice.contiguous()
+                dist.all_reduce(
+                    tmp,
+                    op=dist.ReduceOp.MAX,
+                    group=tp_group.device_group,
                 )
+                buf_slice.copy_(tmp)
 
     if has_decode:
         decode_metadata = layer_attn_metadata.decode
