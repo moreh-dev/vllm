@@ -35,6 +35,33 @@ logger = init_logger(__name__)
 _STRIPE_SIZE = envs.VLLM_ROCM_USE_AITER_CP_INDEXER_STRIPE_SIZE
 
 
+def _m_split_stripes(
+    chunk_m: int,
+    stripe: int,
+    tp_rank: int,
+    tp_world_size: int,
+) -> list[tuple[int, int]]:
+    """List the stripes of a prefill chunk that belong to one rank.
+
+    Stripes are dealt round-robin, so each rank gets an even mix of the cheap
+    early rows and the expensive late ones, and over all ranks they tile the
+    chunk exactly once. The last stripe of the chunk may be short.
+
+    Args:
+        chunk_m: Query rows in the chunk.
+        stripe: Rows per stripe.
+        tp_rank: Rank to enumerate, within its tensor-parallel group.
+        tp_world_size: Ranks in the tensor-parallel group.
+
+    Returns:
+        ``(offset, rows)`` pairs, offsets relative to the start of the chunk.
+    """
+    return [
+        (off, min(stripe, chunk_m - off))
+        for off in range(tp_rank * stripe, chunk_m, tp_world_size * stripe)
+    ]
+
+
 @functools.cache
 def _get_aiter_topk_ops() -> tuple[Callable[..., None], Callable[..., None]] | None:
     try:
@@ -1105,12 +1132,19 @@ def rocm_aiter_sparse_attn_indexer(
         )
 
     if has_prefill:
+        from vllm._aiter_ops import rocm_aiter_ops
+
         tp_group = get_tp_group()
         tp_rank = tp_group.rank_in_group
         tp_world_size = tp_group.world_size
-        # Candidate-block producers and consumers retain the replicated path.
-        # Their auxiliary state is not part of the Top-K-only collective.
-        use_m_split = envs.VLLM_ROCM_USE_AITER_CP_INDEXER and candidate_blocks is None
+        # Candidate-block batches stay replicated: the auxiliary state they
+        # build is not covered by the Top-K-only collective below.
+        use_m_split = (
+            rocm_aiter_ops.is_cp_indexer_enabled() and candidate_blocks is None
+        )
+        # The collective spans the whole prefill range, so it is only needed if
+        # some chunk was actually striped.
+        any_m_split = False
 
         prefill_metadata = layer_attn_metadata.prefill
         assert prefill_metadata is not None
@@ -1134,18 +1168,16 @@ def rocm_aiter_sparse_attn_indexer(
 
             chunk_m = chunk.token_end - chunk.token_start
             if use_m_split and tp_world_size > 1 and chunk_m >= tp_world_size:
-                # Interleaved M-split: each rank takes stripes of size
-                # _STRIPE_SIZE across the full M range.  Distributes causal
-                # work evenly (rank 0 gets cheap early rows, rank 7 gets
-                # expensive late rows, but each rank's TOTAL work ≈ M²/2/tp).
+                # Each rank takes stripes of _STRIPE_SIZE rows across the full
+                # M range. Causal cost grows with row index, so interleaving
+                # leaves every rank ~M**2/2/tp of work rather than handing the
+                # last rank all the expensive rows.
+                any_m_split = True
                 stripe = max(1, min(_STRIPE_SIZE, chunk_m // tp_world_size))
-                block = tp_world_size * stripe
 
-                for block_start in range(0, chunk_m, block):
-                    local_off = block_start + tp_rank * stripe
-                    if local_off >= chunk_m:
-                        break
-                    local_m = min(stripe, chunk_m - local_off)
+                for local_off, local_m in _m_split_stripes(
+                    chunk_m, stripe, tp_rank, tp_world_size
+                ):
                     local_start = chunk.token_start + local_off
                     local_end = local_start + local_m
                     logits = rocm_fp8_mqa_logits(
@@ -1160,9 +1192,6 @@ def rocm_aiter_sparse_attn_indexer(
                     topk_indices = topk_indices_buffer[
                         local_start:local_end, :topk_tokens
                     ]
-                    # A stripe can cover only a subset of rows from each
-                    # request, so localized top-k cannot reconstruct the
-                    # per-request logits windows safely here.
                     aiter_topk_kernel = _get_aiter_top_k_kernel(
                         is_prefill=True,
                         compress_ratio=compress_ratio,
@@ -1189,7 +1218,6 @@ def rocm_aiter_sparse_attn_indexer(
                             topk_tokens,
                         )
             else:
-                # Keep the existing replicated path for unsupported batches.
                 logits = rocm_fp8_mqa_logits(
                     q_fp8[chunk.token_start : chunk.token_end],
                     (k_fp8, k_scale.view(torch.float32)),
@@ -1255,8 +1283,12 @@ def rocm_aiter_sparse_attn_indexer(
                         topk_tokens,
                     )
 
-        # AllReduce(MAX): unwritten positions = -1, MAX recovers full result
-        if use_m_split and tp_world_size > 1:
+        # One collective covers the whole prefill range, so it is guarded on
+        # whether any chunk split rather than on a single chunk's size. Rows a
+        # rank did not own are still -1 from the reset above, and rows from
+        # chunks that stayed replicated hold the same value on every rank, so
+        # MAX reassembles the batch and is idempotent on the unsplit parts.
+        if any_m_split:
             prefill_start = num_decode_tokens
             prefill_end = hidden_states.shape[0]
             buf_slice = topk_indices_buffer[prefill_start:prefill_end, :topk_tokens]
