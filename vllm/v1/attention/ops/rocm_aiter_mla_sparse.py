@@ -6,10 +6,12 @@ import math
 from importlib.util import find_spec
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -23,6 +25,9 @@ if current_platform.is_rocm():
 else:
     _ON_GFX942 = False
     _ON_GFX950 = False
+
+# Interleaved query-row stripes balance causal work across TP ranks.
+_STRIPE_SIZE = envs.VLLM_ROCM_USE_AITER_CP_INDEXER_STRIPE_SIZE
 
 
 @triton.jit
@@ -630,6 +635,22 @@ def mqa_logits_module():
     return None
 
 
+@functools.lru_cache
+def _hip_mqa_logits_module():
+    """aiter's hand-written gfx950 HIP prefill indexer logits kernel
+    (``aiter.ops.fp8_mqa_logits``, moreh-dev/rocm-aiter PR #4), or None when
+    disabled or not shipped by the installed aiter."""
+    if not envs.VLLM_ROCM_USE_AITER_HIP_MQA_LOGITS:
+        return None
+    try:
+        mod = importlib.import_module("aiter.ops.fp8_mqa_logits")
+    except ImportError:
+        return None
+    if not (hasattr(mod, "fp8_mqa_logits") and hasattr(mod, "is_supported")):
+        return None
+    return mod
+
+
 def rocm_fp8_mqa_logits(
     q: torch.Tensor,
     kv: tuple[torch.Tensor, torch.Tensor],
@@ -665,6 +686,26 @@ def rocm_fp8_mqa_logits(
         return flydsl_fp8_mqa_logits(
             q, k_fp8, scale, weights, cu_seqlen_ks, cu_seqlen_ke
         )
+
+    # gfx950: prefer aiter's HIP kernel (fixed 32 heads x 128 dims, the GLM-5 /
+    # DeepSeek-V3.2 indexer shape); other shapes fall through to Triton.
+    if _ON_GFX950 and rocm_aiter_ops.is_enabled():
+        hip = _hip_mqa_logits_module()
+        if (
+            hip is not None
+            and q.dim() == 3
+            and k_fp8.dim() == 2
+            and k_fp8.shape[1] == q.shape[2]
+            and hip.is_supported(q.shape[1], q.shape[2])
+        ):
+            return hip.fp8_mqa_logits(
+                q,
+                k_fp8,
+                scale.reshape(-1).contiguous(),
+                weights.contiguous(),
+                cu_seqlen_ks,
+                cu_seqlen_ke,
+            )
 
     aiter_mqa_logits_module = None
     if rocm_aiter_ops.is_enabled() or rocm_aiter_ops.is_rdna_aiter_enabled():
@@ -801,6 +842,11 @@ def rocm_aiter_sparse_attn_indexer(
         )
 
     if has_prefill:
+        tp_group = get_tp_group()
+        tp_rank = tp_group.rank_in_group
+        tp_world_size = tp_group.world_size
+        use_m_split = envs.VLLM_ROCM_USE_AITER_CP_INDEXER
+
         prefill_metadata = layer_attn_metadata.prefill
         assert prefill_metadata is not None
 
@@ -820,29 +866,90 @@ def rocm_aiter_sparse_attn_indexer(
                 chunk.cu_seq_lens,
                 token_to_seq=chunk.token_to_seq,
             )
-            logits = rocm_fp8_mqa_logits(
-                q_fp8[chunk.token_start : chunk.token_end],
-                (k_fp8, k_scale.view(torch.float32)),
-                weights[chunk.token_start : chunk.token_end],
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
-            )
-            topk_indices = topk_indices_buffer[
-                chunk.token_start : chunk.token_end, :topk_tokens
-            ]
 
-            num_rows = logits.shape[0]
+            chunk_m = chunk.token_end - chunk.token_start
+            if use_m_split and tp_world_size > 1 and chunk_m >= tp_world_size:
+                # Interleaved M-split: each rank takes stripes of size
+                # _STRIPE_SIZE across the full M range.  Distributes causal
+                # work evenly (rank 0 gets cheap early rows, rank 7 gets
+                # expensive late rows, but each rank's TOTAL work ≈ M²/2/tp).
+                stripe = max(1, min(_STRIPE_SIZE, chunk_m // tp_world_size))
+                block = tp_world_size * stripe
 
-            torch.ops._C.top_k_per_row_prefill(
-                logits,
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
-                topk_indices,
-                num_rows,
-                logits.stride(0),
-                logits.stride(1),
-                topk_tokens,
-            )
+                for block_start in range(0, chunk_m, block):
+                    local_off = block_start + tp_rank * stripe
+                    if local_off >= chunk_m:
+                        break
+                    local_m = min(stripe, chunk_m - local_off)
+                    local_start = chunk.token_start + local_off
+                    local_end = local_start + local_m
+                    logits = rocm_fp8_mqa_logits(
+                        q_fp8[local_start:local_end],
+                        (k_fp8, k_scale.view(torch.float32)),
+                        weights[local_start:local_end],
+                        chunk.cu_seqlen_ks[local_off : local_off + local_m],
+                        chunk.cu_seqlen_ke[local_off : local_off + local_m],
+                    )
+
+                    num_rows = logits.shape[0]
+                    topk_indices = topk_indices_buffer[
+                        local_start:local_end, :topk_tokens
+                    ]
+                    torch.ops._C.top_k_per_row_prefill(
+                        logits,
+                        chunk.cu_seqlen_ks[local_off : local_off + local_m],
+                        chunk.cu_seqlen_ke[local_off : local_off + local_m],
+                        topk_indices,
+                        num_rows,
+                        logits.stride(0),
+                        logits.stride(1),
+                        topk_tokens,
+                    )
+            else:
+                # Keep the existing replicated path for unsupported batches.
+                logits = rocm_fp8_mqa_logits(
+                    q_fp8[chunk.token_start : chunk.token_end],
+                    (k_fp8, k_scale.view(torch.float32)),
+                    weights[chunk.token_start : chunk.token_end],
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                )
+                topk_indices = topk_indices_buffer[
+                    chunk.token_start : chunk.token_end, :topk_tokens
+                ]
+
+                num_rows = logits.shape[0]
+
+                torch.ops._C.top_k_per_row_prefill(
+                    logits,
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                    topk_indices,
+                    num_rows,
+                    logits.stride(0),
+                    logits.stride(1),
+                    topk_tokens,
+                )
+
+        # AllReduce(MAX): unwritten positions = -1, MAX recovers full result
+        if use_m_split and tp_world_size > 1:
+            prefill_start = num_decode_tokens
+            prefill_end = hidden_states.shape[0]
+            buf_slice = topk_indices_buffer[prefill_start:prefill_end, :topk_tokens]
+            if buf_slice.is_contiguous():
+                dist.all_reduce(
+                    buf_slice,
+                    op=dist.ReduceOp.MAX,
+                    group=tp_group.device_group,
+                )
+            else:
+                tmp = buf_slice.contiguous()
+                dist.all_reduce(
+                    tmp,
+                    op=dist.ReduceOp.MAX,
+                    group=tp_group.device_group,
+                )
+                buf_slice.copy_(tmp)
 
     if has_decode:
         decode_metadata = layer_attn_metadata.decode
@@ -905,6 +1012,142 @@ def rocm_aiter_sparse_attn_indexer(
             )
 
     return topk_indices_buffer
+
+
+# ``cos_sin_cache`` is ``cat((cos, sin), dim=-1)`` and constant after init, but
+# the kernel wants the halves separately. Splitting per forward would rewrite the
+# whole table once per layer per step; these views cost nothing, since the kernel
+# indexes by row stride and only needs the last dim contiguous.
+_INDEXER_ROPE_COS_ATTR = "aiter_indexer_rope_cos"
+_INDEXER_ROPE_SIN_ATTR = "aiter_indexer_rope_sin"
+
+
+def register_indexer_rope_halves(rope: torch.nn.Module) -> None:
+    cache = getattr(rope, "cos_sin_cache", None)
+    if not isinstance(cache, torch.Tensor) or cache.ndim != 2:
+        return
+    half = cache.shape[-1] // 2
+    rope.register_buffer(_INDEXER_ROPE_COS_ATTR, cache[:, :half], persistent=False)
+    rope.register_buffer(_INDEXER_ROPE_SIN_ATTR, cache[:, half:], persistent=False)
+
+
+def get_indexer_rope_halves(
+    rope: torch.nn.Module, dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """cos/sin halves in ``dtype``, from the buffers registered at init.
+
+    The fallback covers a cache rebuilt or re-typed after registration.
+    """
+    cos = getattr(rope, _INDEXER_ROPE_COS_ATTR, None)
+    sin = getattr(rope, _INDEXER_ROPE_SIN_ATTR, None)
+    if cos is not None and sin is not None and cos.dtype == dtype:
+        return cos, sin
+    cache = rope.cos_sin_cache.to(dtype)
+    half = cache.shape[-1] // 2
+    return cache[:, :half], cache[:, half:]
+
+
+def rocm_aiter_indexer_qk_rope_quant_and_cache_fake(
+    k_cache_prefix: LayerNameType,
+    kv_cache: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    positions: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_bias: torch.Tensor,
+    q_fp8_out: torch.Tensor,
+    weights_out: torch.Tensor,
+    epsilon: float,
+    quant_block_size: int,
+    scale_fmt: str,
+    weights_scale: float,
+    zero_outputs: bool,
+    is_neox: bool,
+) -> None:
+    return None
+
+
+def rocm_aiter_indexer_qk_rope_quant_and_cache(
+    k_cache_prefix: LayerNameType,
+    kv_cache: torch.Tensor,
+    q: torch.Tensor,  # [num_tokens, n_heads, head_dim], raw post-wq_b
+    k: torch.Tensor,  # [num_tokens, head_dim], raw pre-norm/rope
+    weights: torch.Tensor,  # [num_tokens, n_heads], raw post-weights_proj
+    positions: torch.Tensor,  # [num_tokens]
+    cos: torch.Tensor,  # [max_position, rope_dim // 2]
+    sin: torch.Tensor,  # [max_position, rope_dim // 2]
+    norm_weight: torch.Tensor,  # [head_dim], q dtype
+    norm_bias: torch.Tensor,  # [head_dim], q dtype
+    q_fp8_out: torch.Tensor,  # [>= num_tokens, n_heads, head_dim] fp8, written
+    weights_out: torch.Tensor,  # [>= num_tokens, n_heads] fp32, written
+    epsilon: float,
+    quant_block_size: int,
+    scale_fmt: str,
+    weights_scale: float,
+    zero_outputs: bool,
+    is_neox: bool,
+) -> None:
+    """Run aiter's fused DSA indexer QK kernel into the caller's buffers.
+
+    One launch covers RoPE on q and k, LayerNorm on k, per-group FP8
+    quantization of both, the q scale folded into ``weights_out``, and the
+    paged indexer K-cache write.
+    """
+    from aiter import indexer_qk_rope_quant_and_cache
+
+    attn_metadata = get_forward_context().attn_metadata
+    # Profiling / dummy run: no slot_mapping, so nothing to write. The caller's
+    # buffers are already shaped, which is all tracing and profiling need.
+    if not isinstance(attn_metadata, dict):
+        return
+    from vllm.utils.torch_utils import _resolve_layer_name
+
+    k_cache_prefix = _resolve_layer_name(k_cache_prefix)
+    layer_attn_metadata = attn_metadata[k_cache_prefix]
+    assert isinstance(layer_attn_metadata, DeepseekV32IndexerMetadata)
+    slot_mapping = layer_attn_metadata.slot_mapping
+    num_tokens = slot_mapping.shape[0]
+
+    # Outputs cover one row per input token, CUDA-graph padding included: decode
+    # reads weights[:batch_size * next_n], which can exceed num_tokens. Rows the
+    # kernel skips must read as zero, so the padded logits they feed stay finite.
+    # Slice here, not in the caller, to keep the mutated args base tensors.
+    total = q.shape[0]
+    # The kernel indexes q/k/weights by slot_mapping row, so extra slots would
+    # read past their ends.
+    assert num_tokens <= total, (
+        f"slot_mapping has {num_tokens} rows but only {total} query rows"
+    )
+    q_fp8_out = q_fp8_out[:total]
+    weights_out = weights_out[:total]
+    if zero_outputs:
+        q_fp8_out.zero_()
+        weights_out.zero_()
+    indexer_qk_rope_quant_and_cache(
+        q[:num_tokens],
+        q_fp8_out[:num_tokens],
+        weights[:num_tokens],
+        weights_out[:num_tokens],
+        k[:num_tokens],
+        kv_cache,
+        slot_mapping,
+        norm_weight,
+        norm_bias,
+        positions[:num_tokens],
+        cos,
+        sin,
+        epsilon,
+        quant_block_size,
+        scale_fmt,
+        weights_scale,
+        # Same layout predicate the readers use: tiled in-block for
+        # block_size > 1, flat otherwise.
+        preshuffle=kv_cache.shape[1] > 1,
+        is_neox=is_neox,
+    )
 
 
 def _decode_e8m0_scales(scale: torch.Tensor) -> torch.Tensor:

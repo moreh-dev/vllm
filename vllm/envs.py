@@ -132,6 +132,9 @@ if TYPE_CHECKING:
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
     VLLM_ROCM_USE_AITER: bool = False
+    VLLM_ROCM_USE_AITER_CP_INDEXER: bool = False
+    VLLM_ROCM_USE_AITER_CP_INDEXER_STRIPE_SIZE: int = 512
+    VLLM_ROCM_USE_AITER_HIP_MQA_LOGITS: bool = True
     VLLM_ROCM_USE_AITER_CUSTOM_AR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
@@ -142,6 +145,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_MLA: bool = True
     VLLM_ROCM_AITER_MLA_ASM_PADDING: Literal["auto", "gluon", "asm"] = "auto"
     VLLM_ROCM_USE_AITER_MHA: bool = True
+    VLLM_ROCM_USE_AITER_INDEXER_QK_FUSION: bool = False
     VLLM_ROCM_USE_AITER_FP4_ASM_GEMM: bool = False
     VLLM_ROCM_USE_AITER_TRITON_ROPE: bool = False
     VLLM_ROCM_USE_AITER_FP8BMM: bool = True
@@ -1303,10 +1307,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ["auto", "gluon", "asm"],
         case_sensitive=False,
     ),
+    "VLLM_ROCM_USE_AITER_CP_INDEXER": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_CP_INDEXER", "False").lower() in ("true", "1")
+    ),
+    "VLLM_ROCM_USE_AITER_CP_INDEXER_STRIPE_SIZE": lambda: int(
+        os.getenv("VLLM_ROCM_USE_AITER_CP_INDEXER_STRIPE_SIZE", "512")
+    ),
+    # Use aiter's hand-written HIP prefill indexer logits kernel
+    # (aiter.ops.fp8_mqa_logits, gfx950 only) for the DSA sparse indexer instead
+    # of the Triton/gluon kernel. Falls back to Triton when the installed aiter
+    # does not provide it or the indexer shape is unsupported.
+    "VLLM_ROCM_USE_AITER_HIP_MQA_LOGITS": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_HIP_MQA_LOGITS", "True").lower() in ("true", "1")
+    ),
     # Whether to use aiter mha ops.
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_MHA": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_MHA", "True").lower() in ("true", "1")
+    ),
+    # Whether to use the aiter fused indexer QK kernel
+    # (indexer_qk_rope_quant_and_cache) on DeepSeek sparse attention models
+    # (DeepSeek-V3.2, GLM-5.x): fuses the indexer's Q/K RoPE, K LayerNorm,
+    # FP8 quantization and K-cache write into one launch. Needs
+    # VLLM_ROCM_USE_AITER=1 on gfx942/gfx950.
+    # By default is disabled.
+    "VLLM_ROCM_USE_AITER_INDEXER_QK_FUSION": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_INDEXER_QK_FUSION", "False").lower()
+        in ("true", "1")
     ),
     # Whether to use aiter fp4 gemm asm.
     # By default is disabled.
