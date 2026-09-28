@@ -4,9 +4,10 @@
 
 ``rocm_aiter_sparse_attn_indexer`` normally has every TP rank score every
 prefill query row and reach the same Top-K. With
-``VLLM_ROCM_USE_AITER_CP_INDEXER=1`` the rows are dealt across the ranks in
-interleaved stripes and the batch is rebuilt with an ``all_reduce(MAX)`` over a
-``-1``-filled Top-K buffer.
+``VLLM_ROCM_USE_AITER_CP_INDEXER=1`` the rows are dealt across the ranks as
+mirrored stripes -- rank ``r`` takes stripe ``r`` of the first half and stripe
+``tp - 1 - r`` of the second -- and the batch is rebuilt with an
+``all_reduce(MAX)`` over a ``-1``-filled Top-K buffer.
 
 Every test runs the real op -- real Triton/AITER kernels, real collective --
 over byte-identical inputs with the feature off and then on. The flag is the
@@ -48,19 +49,19 @@ LAYER = "model.layers.0.self_attn.indexer"
 HEAD_DIM = 128
 NUM_HEADS = 32
 TOPK_TOKENS = 2048
-# (num_tokens, context, num_chunks, buffer_width). The stripe is
-# ``min(_STRIPE_SIZE, num_tokens // tp)``, so num_tokens decides whether the
-# 512 cap binds and how many blocks each rank walks.
+# (num_tokens, context, num_chunks, buffer_width). Above ``2 * tp`` rows each
+# rank walks exactly two stripes of ``num_tokens // (2 * tp)`` rows; at or
+# below it the split degrades to a single stripe per rank.
 SHAPES = (
     # The context must exceed TOPK_TOKENS by a good margin, or every row keeps
     # every key and the Top-K stops discriminating.
     #
-    # cap does not bind: small stripes, one block per rank at tp=8
+    # small stripes, well above the 2*tp branch point
     (2000, 8192, 1, TOPK_TOKENS),
     # same, split into chunks so the any_m_split guard sees more than one
     (2000, 8192, 3, TOPK_TOKENS),
-    # cap binds: several blocks per rank, a ragged final stripe, and rows whose
-    # window is narrower than TOPK_TOKENS, so -1 padding survives the merge
+    # a ragged split (num_tokens not divisible by 2*tp) plus rows whose window
+    # is narrower than TOPK_TOKENS, so -1 padding survives the merge
     (9000, 8192, 1, TOPK_TOKENS),
     # the shape the feature targets -- few rows against a long context
     (512, 65536, 1, TOPK_TOKENS),

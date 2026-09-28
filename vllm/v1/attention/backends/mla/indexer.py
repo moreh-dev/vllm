@@ -1234,11 +1234,15 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         workspace_size: int,
         max_logits_bytes: int,
         request_offset: int = 0,
+        m_split_world_size: int = 1,
     ) -> list[tuple[slice, slice]]:
         """Split this step's prefill requests into chunks, respecting:
         - N constraint: total_seq_lens <= workspace_size (existing O(N)
           workspace)
-        - Logits constraint: M * N * 4 <= max_logits_bytes
+        - Logits constraint: M * N * 4 <= max_logits_bytes. The CP indexer
+          stripes prefill rows across ``m_split_world_size`` TP ranks and each
+          rank materialises only its own stripe, so the bound applies per rank
+          and M may be that many times larger.
 
         When a single request-level chunk still exceeds the logits budget,
         sub-chunks on the query dimension (M) to bound peak memory.
@@ -1247,7 +1251,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         """
         chunks: list[tuple[slice, slice]] = []
         n = len(compressed_seq_lens_cpu)
-        max_logits_elems = max_logits_bytes // 4
+        max_logits_elems = (max_logits_bytes // 4) * m_split_world_size
         end = 0
 
         while end < n:
@@ -1366,6 +1370,17 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 query_start_loc_cpu[num_decodes : num_decodes + num_prefills + 1]
             )
             max_logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+            # With the CP indexer the prefill rows of a chunk are striped over
+            # the TP ranks and each rank only ever holds its own stripe of the
+            # [M, N] logits, so the per-chunk M bound can grow by the world
+            # size without raising per-rank peak memory.
+            m_split_world_size = 1
+            from vllm._aiter_ops import rocm_aiter_ops
+
+            if rocm_aiter_ops.is_cp_indexer_enabled():
+                from vllm.distributed.parallel_state import get_tp_group
+
+                m_split_world_size = max(1, get_tp_group().world_size)
             # Upper bound is exact for prefill rows (the `[num_decodes:]`
             # slice below).
             assert common_attn_metadata.seq_lens_cpu_upper_bound is not None
@@ -1403,6 +1418,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     self.max_prefill_buffer_size,
                     max_logits_bytes,
                     request_offset=num_decodes,
+                    m_split_world_size=m_split_world_size,
                 )
 
             chunks = []

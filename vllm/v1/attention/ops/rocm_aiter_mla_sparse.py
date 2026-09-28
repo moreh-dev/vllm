@@ -33,13 +33,9 @@ logger = init_logger(__name__)
 
 FP8_DTYPE = current_platform.fp8_dtype()
 
-# Interleaved query-row stripes balance causal work across TP ranks.
-_STRIPE_SIZE = envs.VLLM_ROCM_USE_AITER_CP_INDEXER_STRIPE_SIZE
-
 
 def _m_split_stripes(
     chunk_m: int,
-    stripe: int,
     tp_rank: int,
     tp_world_size: int,
 ) -> list[tuple[int, int]]:
@@ -58,10 +54,27 @@ def _m_split_stripes(
     Returns:
         ``(offset, rows)`` pairs, offsets relative to the start of the chunk.
     """
-    return [
-        (off, min(stripe, chunk_m - off))
-        for off in range(tp_rank * stripe, chunk_m, tp_world_size * stripe)
-    ]
+
+    if chunk_m <= 2 * tp_world_size:
+        stripe = chunk_m // tp_world_size
+        return [
+            (off, min(stripe, chunk_m - off))
+            for off in range(tp_rank * stripe, chunk_m, tp_world_size * stripe)
+        ]
+    else:
+        chunk_left = chunk_m // 2
+        chunk_right = chunk_m - chunk_left
+
+        stripe_left = chunk_left // tp_world_size
+        stripe_right = chunk_right // tp_world_size
+
+        return [
+            (off, min(stripe_left, chunk_left - off))
+            for off in range(tp_rank * stripe_left, chunk_left, tp_world_size * stripe_left)
+        ] + [
+            (chunk_left + off, min(stripe_right, chunk_right - off))
+            for off in range((tp_world_size - tp_rank - 1) * stripe_right, chunk_right, tp_world_size * stripe_right)
+        ]
 
 
 @functools.cache
@@ -1359,15 +1372,15 @@ def rocm_aiter_sparse_attn_indexer(
 
             chunk_m = chunk.token_end - chunk.token_start
             if use_m_split and tp_world_size > 1 and chunk_m >= tp_world_size:
-                # Each rank takes stripes of _STRIPE_SIZE rows across the full
-                # M range. Causal cost grows with row index, so interleaving
-                # leaves every rank ~M**2/2/tp of work rather than handing the
-                # last rank all the expensive rows.
+                # Each rank takes one stripe from each half of the M range,
+                # mirrored so rank r pairs its cheap low-index stripe with an
+                # expensive high-index one. Causal cost grows with row index,
+                # so this leaves every rank ~M**2/2/tp of work rather than
+                # handing the last rank all the expensive rows.
                 any_m_split = True
-                stripe = max(1, min(_STRIPE_SIZE, chunk_m // tp_world_size))
 
                 for local_off, local_m in _m_split_stripes(
-                    chunk_m, stripe, tp_rank, tp_world_size
+                    chunk_m, tp_rank, tp_world_size
                 ):
                     local_start = chunk.token_start + local_off
                     local_end = local_start + local_m
