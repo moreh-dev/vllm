@@ -1546,6 +1546,20 @@ def _kpool_mixed_write_kernel(
                 )
 
 
+def _kpool_mixed_block_p(n_tokens: int, pool_size: int) -> int:
+    """Pools per prefill program for ``kpool_mixed_write``.
+
+    Chunked-prefill steps (<= 32k tokens on MI355X) favour one pool per
+    program: the tail seeding and decode programs gain more from parallelism
+    than the insert loses (block_p=1 within ~3% of the best at 2k-32k, 4-8%
+    ahead of the standalone heuristic at 16k). Larger unchunked batches use
+    the standalone insert tiers.
+    """
+    if n_tokens // pool_size <= 8192:
+        return 1
+    return _kpool_insert_launch_config(n_tokens, pool_size)[0]
+
+
 def kpool_mixed_write(
     kv_cache: torch.Tensor,
     ape: torch.Tensor,
@@ -1653,7 +1667,7 @@ def kpool_mixed_write(
             prefill_tail_slot_mapping = prefill_tail_slot_mapping.contiguous()
         else:
             prefill_tail_slot_mapping = prefill_slot_mapping  # unused
-        block_p = block_p or _kpool_insert_launch_config(n_tokens, pool_size)[0]
+        block_p = block_p or _kpool_mixed_block_p(n_tokens, pool_size)
         n_prefill_programs = triton.cdiv(triton.cdiv(n_tokens, pool_size), block_p)
     else:
         prefill_k = prefill_gate = ape  # unused placeholders
