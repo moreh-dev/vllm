@@ -34,14 +34,36 @@ if current_platform.is_rocm():
     from vllm.models.glm5next.amd.ops.kpool_compress import (
         kpool_compress_and_write_cache,
         kpool_decode_update_and_maybe_write_cache_batched,
+        kpool_decode_update_parallel,
         kpool_seed_tail_cache,
     )
+
+    # Every decode test runs against both AMD writers: the ordered walk and
+    # the parallel drop-in (which must match it bit for bit).
+    DECODE_IMPLS = {
+        "ordered": kpool_decode_update_and_maybe_write_cache_batched,
+        "parallel": kpool_decode_update_parallel,
+    }
 else:
     from vllm.models.glm5next.nvidia.ops.kpool_compress import (
         kpool_compress_and_write_cache,
         kpool_decode_update_and_maybe_write_cache_batched,
         kpool_seed_tail_cache,
     )
+
+    DECODE_IMPLS = {"ordered": kpool_decode_update_and_maybe_write_cache_batched}
+
+_decode_update = kpool_decode_update_and_maybe_write_cache_batched
+
+
+@pytest.fixture(params=list(DECODE_IMPLS))
+def decode_impl(request):
+    """Run a decode test once per decode writer (``_decode_update``)."""
+    global _decode_update
+    _decode_update = DECODE_IMPLS[request.param]
+    yield request.param
+    _decode_update = kpool_decode_update_and_maybe_write_cache_batched
+
 
 HEAD_DIM = 128
 POOL_SIZE = 16
@@ -296,7 +318,7 @@ def test_amd_prefill_writer_uses_preshuffled_cache_layout():
 def _run_kernel(kv, tail, tail_slot, key, score, ape, slot_map, pos):
     kv = kv.clone()
     tail = tail.clone()
-    kpool_decode_update_and_maybe_write_cache_batched(
+    _decode_update(
         kv,
         tail,
         tail_slot,
@@ -312,6 +334,7 @@ def _run_kernel(kv, tail, tail_slot, key, score, ape, slot_map, pos):
     return kv, tail
 
 
+@pytest.mark.usefixtures("decode_impl")
 @pytest.mark.parametrize("pool_size", [4, 16])
 @pytest.mark.parametrize("ring_pools", [1, 2])
 def test_decode_writer_matches_prefill_writer(pool_size, ring_pools):
@@ -341,7 +364,7 @@ def test_decode_writer_matches_prefill_writer(pool_size, ring_pools):
     tail = torch.zeros(nblk, 2, ring, HEAD_DIM, dtype=torch.bfloat16, device=dev)
     for t in range(n_tok):
         completes = t % pool_size == pool_size - 1
-        kpool_decode_update_and_maybe_write_cache_batched(
+        _decode_update(
             kv_decode,
             tail,
             # token-granular: every token has a valid tail slot
@@ -372,6 +395,7 @@ def test_decode_writer_matches_prefill_writer(pool_size, ring_pools):
     )
 
 
+@pytest.mark.usefixtures("decode_impl")
 @pytest.mark.parametrize("ring_pools", [1, 2])
 def test_rejected_draft_redo_needs_ring_slots(ring_pools):
     """With a one-pool ring, the drafts behind a rejected pool-completing draft
@@ -402,7 +426,7 @@ def test_rejected_draft_redo_needs_ring_slots(ring_pools):
     def step(positions, keys, scores):
         pos = torch.tensor([positions], dtype=torch.int32, device=dev)
         slots = [(p // pool) if p % pool == pool - 1 else -1 for p in positions]
-        kpool_decode_update_and_maybe_write_cache_batched(
+        _decode_update(
             kv,
             tail,
             pos % ring,
@@ -450,6 +474,7 @@ def test_rejected_draft_redo_needs_ring_slots(ring_pools):
         assert pool1_ok
 
 
+@pytest.mark.usefixtures("decode_impl")
 def test_leading_invalid_tail_slot():
     """A request whose FIRST token carries an invalid (-1) tail slot while a
     later token is a real pool completion.
@@ -528,6 +553,7 @@ def test_prefill_seed_honors_padded_tail_block_stride():
     assert torch.all(backing[compact_offset : compact_offset + HEAD_DIM] == sentinel)
 
 
+@pytest.mark.usefixtures("decode_impl")
 @pytest.mark.parametrize(
     "case_id",
     [
@@ -599,6 +625,7 @@ def test_batched_matches_reference(case_id):
     _assert_eq(r_ref, r_kern)
 
 
+@pytest.mark.usefixtures("decode_impl")
 @pytest.mark.parametrize("seed", list(range(20)))
 def test_batched_matches_reference_fuzz(seed):
     """Random B / next_n / start positions; covers 0, 1, and multi completion."""
@@ -653,3 +680,51 @@ def test_batched_matches_reference_fuzz(seed):
     r_ref = _torch_reference(kv, tail, tail_slot, key, score, ape, slot_map, pos)
     r_kern = _run_kernel(kv, tail, tail_slot, key, score, ape, slot_map, pos)
     _assert_eq(r_ref, r_kern)
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm parallel writer")
+@pytest.mark.parametrize("seed", list(range(30)))
+def test_parallel_matches_ordered_adversarial(seed):
+    """Inputs no scheduler emits: repeated / out-of-order positions, random
+    invalid tail slots, shared cache slots, shared tail blocks. The parallel
+    writer resolves ring reads and last writers itself and must still match
+    the ordered walk bit for bit."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    B = int(torch.randint(1, 5, (1,), generator=g, device="cuda"))
+    next_n = int(torch.randint(1, 9, (1,), generator=g, device="cuda"))
+    ring = POOL_SIZE
+    pos = torch.randint(-1, 3 * POOL_SIZE, (B, next_n), generator=g, device="cuda")
+    pos = pos.to(torch.int32)
+    blk = torch.randint(0, NUM_BLOCKS, (B, 1), generator=g, device="cuda")
+    tail_slot = (blk * ring + pos.clamp_min(0) % ring).to(torch.int32)
+    tail_slot[torch.rand(B, next_n, generator=g, device="cuda") < 0.15] = -1
+    completes = (pos >= 0) & (pos % POOL_SIZE == POOL_SIZE - 1)
+    loc = torch.randint(0, 4, (B, next_n), generator=g, device="cuda").to(torch.int32)
+    slot_map = torch.where(completes, loc, torch.full_like(loc, -1))
+    key = torch.randn(B, next_n, HEAD_DIM, generator=g, device="cuda").bfloat16()
+    score = torch.randn(B, next_n, HEAD_DIM, generator=g, device="cuda").bfloat16()
+    ape = torch.randn(POOL_SIZE, HEAD_DIM, generator=g, device="cuda")
+    kv, tail = _make_caches()
+    tail.copy_(torch.randn(tail.shape, generator=g, device="cuda").bfloat16())
+
+    # Requests sharing a tail block or cache slot race across programs in both
+    # kernels; run one request per launch so only intra-request order matters.
+    outs = {}
+    for name, fn in DECODE_IMPLS.items():
+        kv_o, tail_o = kv.clone(), tail.clone()
+        for b in range(B):
+            fn(
+                kv_o,
+                tail_o,
+                tail_slot[b : b + 1],
+                key[b : b + 1],
+                score[b : b + 1],
+                ape,
+                slot_map[b : b + 1],
+                pos[b : b + 1],
+                POOL_SIZE,
+                HEAD_DIM,
+                round_scale=ROUND_SCALE,
+            )
+        outs[name] = (kv_o, tail_o)
+    _assert_eq(outs["ordered"], outs["parallel"])
