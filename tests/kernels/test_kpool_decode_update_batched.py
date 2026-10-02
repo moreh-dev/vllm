@@ -56,8 +56,9 @@ else:
 _decode_update = kpool_decode_update_and_maybe_write_cache_batched
 
 
-@pytest.fixture(autouse=True, params=list(DECODE_IMPLS))
+@pytest.fixture(params=list(DECODE_IMPLS))
 def decode_impl(request):
+    """Run a decode test once per decode writer (``_decode_update``)."""
     global _decode_update
     _decode_update = DECODE_IMPLS[request.param]
     yield request.param
@@ -333,6 +334,7 @@ def _run_kernel(kv, tail, tail_slot, key, score, ape, slot_map, pos):
     return kv, tail
 
 
+@pytest.mark.usefixtures("decode_impl")
 @pytest.mark.parametrize("pool_size", [4, 16])
 @pytest.mark.parametrize("ring_pools", [1, 2])
 def test_decode_writer_matches_prefill_writer(pool_size, ring_pools):
@@ -393,6 +395,7 @@ def test_decode_writer_matches_prefill_writer(pool_size, ring_pools):
     )
 
 
+@pytest.mark.usefixtures("decode_impl")
 @pytest.mark.parametrize("ring_pools", [1, 2])
 def test_rejected_draft_redo_needs_ring_slots(ring_pools):
     """With a one-pool ring, the drafts behind a rejected pool-completing draft
@@ -471,6 +474,7 @@ def test_rejected_draft_redo_needs_ring_slots(ring_pools):
         assert pool1_ok
 
 
+@pytest.mark.usefixtures("decode_impl")
 def test_leading_invalid_tail_slot():
     """A request whose FIRST token carries an invalid (-1) tail slot while a
     later token is a real pool completion.
@@ -549,6 +553,7 @@ def test_prefill_seed_honors_padded_tail_block_stride():
     assert torch.all(backing[compact_offset : compact_offset + HEAD_DIM] == sentinel)
 
 
+@pytest.mark.usefixtures("decode_impl")
 @pytest.mark.parametrize(
     "case_id",
     [
@@ -620,6 +625,7 @@ def test_batched_matches_reference(case_id):
     _assert_eq(r_ref, r_kern)
 
 
+@pytest.mark.usefixtures("decode_impl")
 @pytest.mark.parametrize("seed", list(range(20)))
 def test_batched_matches_reference_fuzz(seed):
     """Random B / next_n / start positions; covers 0, 1, and multi completion."""
@@ -678,13 +684,11 @@ def test_batched_matches_reference_fuzz(seed):
 
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm parallel writer")
 @pytest.mark.parametrize("seed", list(range(30)))
-def test_parallel_matches_ordered_adversarial(seed, decode_impl):
+def test_parallel_matches_ordered_adversarial(seed):
     """Inputs no scheduler emits: repeated / out-of-order positions, random
     invalid tail slots, shared cache slots, shared tail blocks. The parallel
     writer resolves ring reads and last writers itself and must still match
     the ordered walk bit for bit."""
-    if decode_impl != "parallel":
-        pytest.skip("compares the two writers once")
     g = torch.Generator(device="cuda").manual_seed(seed)
     B = int(torch.randint(1, 5, (1,), generator=g, device="cuda"))
     next_n = int(torch.randint(1, 9, (1,), generator=g, device="cuda"))

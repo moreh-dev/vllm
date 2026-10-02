@@ -45,12 +45,7 @@ def _cache_k_offset(
 
 @triton.jit
 def _hadamard128_stage(x, GROUPS: tl.constexpr, STRIDE: tl.constexpr):
-    x3 = tl.reshape(x, (GROUPS, 2, STRIDE))
-    x3 = tl.trans(x3, 0, 2, 1)
-    a, b = tl.split(x3)
-    x3 = tl.join(a + b, a - b)
-    x3 = tl.trans(x3, 0, 2, 1)
-    return tl.reshape(x3, (128,))
+    return _fwht128_rows_stage(x, 128, GROUPS, STRIDE)
 
 
 @triton.jit
@@ -345,6 +340,54 @@ def _hadamard128_rows(x, ROWS: tl.constexpr):
 
 
 @triton.jit
+def _kpool_rotate_quant_store(
+    x,
+    loc,
+    row_ok,
+    buf_fp8_ptr,
+    buf_fp32_ptr,
+    ROWS: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BUF_NUMEL_PER_PAGE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    PRESHUFFLE: tl.constexpr,
+    ROUND_SCALE: tl.constexpr,
+):
+    """Pooled ``[ROWS, HEAD_DIM]`` fp32 -> Hadamard -> fp8 -> cache at ``loc``.
+
+    The single copy of this tail for the fused writers; the bf16 round trips
+    and the op order match ``_kpool_softmax_rotate_write_cache_kernel``.
+    """
+    offs = tl.arange(0, HEAD_DIM)
+    x = x.to(tl.bfloat16).to(tl.float32)
+    x = _hadamard128_rows(x, ROWS).to(tl.bfloat16).to(tl.float32)
+    absmax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-4)
+    if ROUND_SCALE:
+        scale = tl.exp2(tl.ceil(tl.log2(absmax * (1.0 / FP8_MAX))))
+    else:
+        scale = absmax * (1.0 / FP8_MAX)
+    quantized = tl.minimum(tl.maximum(x / scale[:, None], -FP8_MAX), FP8_MAX)
+
+    loc_page_index = loc // PAGE_SIZE
+    loc_token_offset_in_page = loc % PAGE_SIZE
+    out_k_offsets = loc_page_index[:, None] * BUF_NUMEL_PER_PAGE + _cache_k_offset(
+        loc_token_offset_in_page[:, None],
+        offs[None, :],
+        HEAD_DIM,
+        PRESHUFFLE,
+    )
+    out_s_offset = (
+        loc_page_index * BUF_NUMEL_PER_PAGE // 4
+        + S_OFFSET_NBYTES_IN_PAGE // 4
+        + loc_token_offset_in_page
+    )
+    tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=row_ok[:, None])
+    tl.store(buf_fp32_ptr + out_s_offset, scale, mask=row_ok)
+
+
+@triton.jit
 def _kpool_insert_windows(
     pid,
     k_ptr,
@@ -395,7 +438,6 @@ def _kpool_insert_windows(
     n_rounds = tl.max(tl.sum(closes, axis=1), axis=0)
 
     offs = tl.arange(0, HEAD_DIM)
-    fp8_max_inv = 1.0 / FP8_MAX
     for r in tl.range(0, n_rounds):
         pick = (closes != 0) & (rank == r)
         pool_ok = tl.max(pick.to(tl.int32), axis=1) > 0
@@ -430,32 +472,21 @@ def _kpool_insert_windows(
             ).to(tl.float32)
             acc += k * prob
 
-        x = (acc / denom).to(tl.bfloat16).to(tl.float32)
-        x = _hadamard128_rows(x, BLOCK_P).to(tl.bfloat16).to(tl.float32)
-
-        # --- per-vector absmax fp8 quant ---
-        absmax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-4)
-        if ROUND_SCALE:
-            scale = tl.exp2(tl.ceil(tl.log2(absmax * fp8_max_inv)))
-        else:
-            scale = absmax * fp8_max_inv
-        quantized = tl.minimum(tl.maximum(x / scale[:, None], -FP8_MAX), FP8_MAX)
-
-        loc_page_index = loc // PAGE_SIZE
-        loc_token_offset_in_page = loc % PAGE_SIZE
-        out_k_offsets = loc_page_index[:, None] * BUF_NUMEL_PER_PAGE + _cache_k_offset(
-            loc_token_offset_in_page[:, None],
-            offs[None, :],
+        _kpool_rotate_quant_store(
+            acc / denom,
+            loc,
+            pool_ok,
+            buf_fp8_ptr,
+            buf_fp32_ptr,
+            BLOCK_P,
+            PAGE_SIZE,
+            BUF_NUMEL_PER_PAGE,
             HEAD_DIM,
+            S_OFFSET_NBYTES_IN_PAGE,
+            FP8_MAX,
             PRESHUFFLE,
+            ROUND_SCALE,
         )
-        out_s_offset = (
-            loc_page_index * BUF_NUMEL_PER_PAGE // 4
-            + S_OFFSET_NBYTES_IN_PAGE // 4
-            + loc_token_offset_in_page
-        )
-        tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=mask)
-        tl.store(buf_fp32_ptr + out_s_offset, scale, mask=pool_ok)
 
 
 @triton.jit(do_not_specialize=["n_tokens"])
@@ -507,8 +538,8 @@ def _kpool_compress_insert_kernel(
     )
 
 
-def _kpool_insert_launch_config(n_tokens: int, pool_size: int) -> tuple[int, int]:
-    """(pools per program, num_warps) for ``kpool_compress_insert``.
+def _kpool_insert_launch_config(n_tokens: int, pool_size: int) -> int:
+    """Pools per program for ``kpool_compress_insert`` (always one wave).
 
     Tuned on MI355X (GLM-5.3-Flash, pool_size 4): small batches want many
     tiny programs to fill the CUs, large ones want 16 pools per wave for
@@ -517,12 +548,12 @@ def _kpool_insert_launch_config(n_tokens: int, pool_size: int) -> tuple[int, int
     """
     n_pools = n_tokens // pool_size
     if n_pools <= 2048:
-        return 1, 1
+        return 1
     if n_pools <= 8192:
-        return 2, 1
+        return 2
     if n_pools <= 32768:
-        return 8, 1
-    return 16, 1
+        return 8
+    return 16
 
 
 def kpool_compress_insert(
@@ -583,9 +614,8 @@ def kpool_compress_insert(
     ape = ape.contiguous()
     slot_mapping = slot_mapping.contiguous()
 
-    default_p, default_warps = _kpool_insert_launch_config(n_tokens, pool_size)
-    block_p = block_p or default_p
-    num_warps = num_warps or default_warps
+    block_p = block_p or _kpool_insert_launch_config(n_tokens, pool_size)
+    num_warps = num_warps or 1
 
     grid = (triton.cdiv(triton.cdiv(n_tokens, pool_size), block_p),)
     _kpool_compress_insert_kernel[grid](
@@ -977,7 +1007,6 @@ def kpool_decode_update_and_maybe_write_cache_batched(
 @triton.jit
 def _kpool_decode_complete_one(
     c,
-    active,
     t,
     offs,
     completes,
@@ -1011,8 +1040,7 @@ def _kpool_decode_complete_one(
     PRESHUFFLE: tl.constexpr,
     ROUND_SCALE: tl.constexpr,
 ):
-    """Compress the pool closed by the ``c``-th completing token (if active)."""
-    fp8_max_inv = 1.0 / FP8_MAX
+    """Compress the pool closed by the ``c``-th completing token."""
     sel = completes & (rank == c)
     tc = tl.max(tl.where(sel, t, -1), axis=0)
     tpos = tl.max(tl.where(sel, safe_pos, -1), axis=0)
@@ -1038,10 +1066,8 @@ def _kpool_decode_complete_one(
         new = src >= 0
         score = tl.where(
             new,
-            tl.load(
-                in_s + tl.maximum(src, 0) * ss_stride_t, mask=new & active, other=0.0
-            ),
-            tl.load(ring + KPOOL_HEAD + phys * HEAD_DIM, mask=~new & active, other=0.0),
+            tl.load(in_s + tl.maximum(src, 0) * ss_stride_t, mask=new, other=0.0),
+            tl.load(ring + KPOOL_HEAD + phys * HEAD_DIM, mask=~new, other=0.0),
         ).to(tl.float32)
         score += tl.load(ape_ptr + pool_slot * ape_stride_0 + offs)
         max_score = tl.maximum(max_score, score)
@@ -1056,40 +1082,34 @@ def _kpool_decode_complete_one(
         row = tl.maximum(src, 0)
         score = tl.where(
             new,
-            tl.load(in_s + row * ss_stride_t, mask=new & active, other=0.0),
-            tl.load(ring + KPOOL_HEAD + phys * HEAD_DIM, mask=~new & active, other=0.0),
+            tl.load(in_s + row * ss_stride_t, mask=new, other=0.0),
+            tl.load(ring + KPOOL_HEAD + phys * HEAD_DIM, mask=~new, other=0.0),
         ).to(tl.float32)
         k = tl.where(
             new,
-            tl.load(in_k + row * key_stride_t, mask=new & active, other=0.0),
-            tl.load(ring + phys * HEAD_DIM, mask=~new & active, other=0.0),
+            tl.load(in_k + row * key_stride_t, mask=new, other=0.0),
+            tl.load(ring + phys * HEAD_DIM, mask=~new, other=0.0),
         ).to(tl.float32)
         score += tl.load(ape_ptr + pool_slot * ape_stride_0 + offs)
         prob = tl.exp(score - max_score)
         denom += prob
         acc += k * prob
 
-    x = (acc / denom).to(tl.bfloat16).to(tl.float32)
-    x = _hadamard128(x).to(tl.bfloat16).to(tl.float32)
-    absmax = tl.maximum(tl.max(tl.abs(x), axis=0), 1e-4)
-    if ROUND_SCALE:
-        scale = tl.exp2(tl.ceil(tl.log2(absmax * fp8_max_inv)))
-    else:
-        scale = absmax * fp8_max_inv
-    quantized = tl.minimum(tl.maximum(x / scale, -FP8_MAX), FP8_MAX)
-
-    loc_page_index = tloc // PAGE_SIZE
-    loc_token_offset_in_page = tloc % PAGE_SIZE
-    out_k_offsets = loc_page_index * BUF_NUMEL_PER_PAGE + _cache_k_offset(
-        loc_token_offset_in_page, offs, HEAD_DIM, PRESHUFFLE
+    _kpool_rotate_quant_store(
+        tl.reshape(acc / denom, (1, HEAD_DIM)),
+        tl.full((1,), 0, tl.int64) + tloc,
+        tl.full((1,), 1, tl.int1),
+        buf_fp8_ptr,
+        buf_fp32_ptr,
+        1,
+        PAGE_SIZE,
+        BUF_NUMEL_PER_PAGE,
+        HEAD_DIM,
+        S_OFFSET_NBYTES_IN_PAGE,
+        FP8_MAX,
+        PRESHUFFLE,
+        ROUND_SCALE,
     )
-    out_s_offset = (
-        loc_page_index * BUF_NUMEL_PER_PAGE // 4
-        + S_OFFSET_NBYTES_IN_PAGE // 4
-        + loc_token_offset_in_page
-    )
-    tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=active)
-    tl.store(buf_fp32_ptr + out_s_offset, scale, mask=active)
 
 
 @triton.jit
@@ -1169,7 +1189,6 @@ def _kpool_decode_request(
     for c in tl.range(0, n_complete):
         _kpool_decode_complete_one(
             c,
-            True,
             t,
             offs,
             completes,
@@ -1557,7 +1576,7 @@ def _kpool_mixed_block_p(n_tokens: int, pool_size: int) -> int:
     """
     if n_tokens // pool_size <= 8192:
         return 1
-    return _kpool_insert_launch_config(n_tokens, pool_size)[0]
+    return _kpool_insert_launch_config(n_tokens, pool_size)
 
 
 def kpool_mixed_write(
@@ -1627,24 +1646,8 @@ def kpool_mixed_write(
     seed = has_prefill and prefill_tail_slot_mapping is not None
     if not (has_prefill or has_decode):
         return
-    if not has_prefill:
-        # Decode-only steps: the dedicated kernel keeps a lighter program.
-        kpool_decode_update_parallel(
-            kv_cache,
-            tail_kv_cache,
-            decode_tail_slot_mapping,
-            decode_key,
-            decode_gate,
-            ape,
-            decode_slot_mapping,
-            decode_positions,
-            pool_size,
-            head_dim,
-            round_scale=round_scale,
-        )
-        return
     if has_decode or seed:
-        assert tail_kv_cache is not None
+        assert tail_kv_cache is not None, "tail_kv_cache is required"
         assert tail_kv_cache.ndim == 4 and tail_kv_cache.shape[1] == 2
         assert tail_kv_cache.shape[3] == head_dim
         assert tail_kv_cache.dtype == torch.bfloat16
@@ -1655,25 +1658,6 @@ def kpool_mixed_write(
         tail_kv_cache = kv_cache  # unused placeholder
         ring, tail_block_elems, kpool_head = pool_size, 1, 1
 
-    if has_prefill:
-        assert prefill_k.ndim == 2 and prefill_k.shape[1] == head_dim
-        assert prefill_gate.shape == prefill_k.shape
-        assert prefill_k.dtype == torch.bfloat16
-        assert prefill_k.stride(1) == 1 and prefill_gate.stride(1) == 1
-        assert prefill_slot_mapping.shape == (n_tokens,)
-        prefill_slot_mapping = prefill_slot_mapping.contiguous()
-        if seed:
-            assert prefill_tail_slot_mapping.shape == (n_tokens,)
-            prefill_tail_slot_mapping = prefill_tail_slot_mapping.contiguous()
-        else:
-            prefill_tail_slot_mapping = prefill_slot_mapping  # unused
-        block_p = block_p or _kpool_mixed_block_p(n_tokens, pool_size)
-        n_prefill_programs = triton.cdiv(triton.cdiv(n_tokens, pool_size), block_p)
-    else:
-        prefill_k = prefill_gate = ape  # unused placeholders
-        prefill_slot_mapping = prefill_tail_slot_mapping = ape
-        block_p, n_prefill_programs = 1, 0
-
     if has_decode:
         assert decode_key.ndim == 3 and decode_key.shape[2] == head_dim
         assert decode_key.dtype == torch.bfloat16
@@ -1681,7 +1665,7 @@ def kpool_mixed_write(
         assert decode_gate.dtype == torch.bfloat16
         assert decode_key.stride(2) == 1 and decode_gate.stride(2) == 1
         for m in (decode_tail_slot_mapping, decode_slot_mapping, decode_positions):
-            assert m.shape == (num_decode, next_n)
+            assert m is not None and m.shape == (num_decode, next_n)
         decode_tail_slot_mapping = decode_tail_slot_mapping.contiguous()
         decode_slot_mapping = decode_slot_mapping.contiguous()
         decode_positions = decode_positions.contiguous()
@@ -1690,6 +1674,37 @@ def kpool_mixed_write(
         num_decode = 0
         dkey = dgate = tail_kv_cache  # unused placeholders
         decode_tail_slot_mapping = decode_slot_mapping = decode_positions = ape
+
+    if not has_prefill:
+        # Decode-only steps: the dedicated kernel keeps a lighter program.
+        kpool_decode_update_parallel(
+            kv_cache,
+            tail_kv_cache,
+            decode_tail_slot_mapping,
+            dkey,
+            dgate,
+            ape,
+            decode_slot_mapping,
+            decode_positions,
+            pool_size,
+            head_dim,
+            round_scale=round_scale,
+        )
+        return
+
+    assert prefill_k.ndim == 2 and prefill_k.shape[1] == head_dim
+    assert prefill_gate.shape == prefill_k.shape
+    assert prefill_k.dtype == torch.bfloat16
+    assert prefill_k.stride(1) == 1 and prefill_gate.stride(1) == 1
+    assert prefill_slot_mapping.shape == (n_tokens,)
+    prefill_slot_mapping = prefill_slot_mapping.contiguous()
+    if seed:
+        assert prefill_tail_slot_mapping.shape == (n_tokens,)
+        prefill_tail_slot_mapping = prefill_tail_slot_mapping.contiguous()
+    else:
+        prefill_tail_slot_mapping = prefill_slot_mapping  # unused
+    block_p = block_p or _kpool_mixed_block_p(n_tokens, pool_size)
+    n_prefill_programs = triton.cdiv(triton.cdiv(n_tokens, pool_size), block_p)
 
     _kpool_mixed_write_kernel[(num_decode + n_prefill_programs,)](
         kv_cache.view(FP8_DTYPE),

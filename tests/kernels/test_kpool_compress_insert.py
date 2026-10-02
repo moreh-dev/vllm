@@ -437,3 +437,23 @@ def test_mixed_write_without_seeding():
     kv, tail = _mixed_fused(c, seed_tail=False)
     assert torch.equal(kv, ref_kv)
     assert torch.equal(tail, ref_tail)
+
+
+@pytest.mark.parametrize("prefill_lens", [[], [64]])
+def test_mixed_write_requires_tail_cache(prefill_lens):
+    # Decode-only and mixed steps must report the missing tail cache the same way.
+    c = _mixed_step(prefill_lens, 3, 2)
+    with pytest.raises(AssertionError, match="tail_kv_cache is required"):
+        kpool_mixed_write(
+            c["kv"],
+            c["ape"],
+            c["pool_size"],
+            prefill_k=c["k"],
+            prefill_gate=c["gate"],
+            prefill_slot_mapping=c["slot"],
+            decode_tail_slot_mapping=c["dtail"],
+            decode_key=c["dkey"],
+            decode_gate=c["dgate"],
+            decode_slot_mapping=c["dslot"],
+            decode_positions=c["pos"],
+        )
