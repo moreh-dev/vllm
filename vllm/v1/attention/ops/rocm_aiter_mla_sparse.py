@@ -36,8 +36,53 @@ logger = init_logger(__name__)
 
 FP8_DTYPE = current_platform.fp8_dtype()
 
-# Interleaved query-row stripes balance causal work across TP ranks.
-_STRIPE_SIZE = envs.VLLM_ROCM_USE_AITER_CP_INDEXER_STRIPE_SIZE
+
+def _m_split_stripes(
+    chunk_m: int,
+    tp_rank: int,
+    tp_world_size: int,
+) -> list[tuple[int, int]]:
+    """List the stripes of a prefill chunk that belong to one rank.
+
+    Pair an early stripe with a mirrored late stripe to balance causal work.
+    Remainders are dealt round-robin within each half. Every row has one owner,
+    including chunks with fewer rows than ranks.
+
+    Args:
+        chunk_m: Query rows in the chunk.
+        tp_rank: Rank to enumerate, within its tensor-parallel group.
+        tp_world_size: Ranks in the tensor-parallel group.
+
+    Returns:
+        ``(offset, rows)`` pairs, offsets relative to the start of the chunk.
+
+    """
+    if chunk_m <= 2 * tp_world_size:
+        stripe = max(1, chunk_m // tp_world_size)
+        return [
+            (off, min(stripe, chunk_m - off))
+            for off in range(tp_rank * stripe, chunk_m, tp_world_size * stripe)
+        ]
+    else:
+        chunk_left = chunk_m // 2
+        chunk_right = chunk_m - chunk_left
+
+        stripe_left = chunk_left // tp_world_size
+        stripe_right = chunk_right // tp_world_size
+
+        return [
+            (off, min(stripe_left, chunk_left - off))
+            for off in range(
+                tp_rank * stripe_left, chunk_left, tp_world_size * stripe_left
+            )
+        ] + [
+            (chunk_left + off, min(stripe_right, chunk_right - off))
+            for off in range(
+                (tp_world_size - tp_rank - 1) * stripe_right,
+                chunk_right,
+                tp_world_size * stripe_right,
+            )
+        ]
 
 
 @functools.cache
@@ -1418,12 +1463,23 @@ def rocm_aiter_sparse_attn_indexer(
         tp_group = get_tp_group()
         tp_rank = tp_group.rank_in_group
         tp_world_size = tp_group.world_size
-        # Candidate-block producers and consumers retain the replicated path.
-        # Their auxiliary state is not part of the Top-K-only collective.
-        use_m_split = envs.VLLM_ROCM_USE_AITER_CP_INDEXER and candidate_blocks is None
-
+        # Candidate-block batches stay replicated: the auxiliary state they
+        # build is not covered by the Top-K-only collective below.
+        use_m_split = (
+            rocm_aiter_ops.is_cp_indexer_enabled() and candidate_blocks is None
+        )
         prefill_metadata = layer_attn_metadata.prefill
         assert prefill_metadata is not None
+        # Choose once per batch so short tails also have one writer when
+        # larger chunks require a collective. Entirely small batches replicate.
+        any_m_split = (
+            use_m_split
+            and tp_world_size > 1
+            and any(
+                chunk.token_end - chunk.token_start >= tp_world_size
+                for chunk in prefill_metadata.chunks
+            )
+        )
 
         workspace_manager = current_workspace_manager()
         k_fp8_full, k_scale_full = workspace_manager.get_simultaneous(
@@ -1446,19 +1502,15 @@ def rocm_aiter_sparse_attn_indexer(
             )
 
             chunk_m = chunk.token_end - chunk.token_start
-            if use_m_split and tp_world_size > 1 and chunk_m >= tp_world_size:
-                # Interleaved M-split: each rank takes stripes of size
-                # _STRIPE_SIZE across the full M range.  Distributes causal
-                # work evenly (rank 0 gets cheap early rows, rank 7 gets
-                # expensive late rows, but each rank's TOTAL work ≈ M²/2/tp).
-                stripe = max(1, min(_STRIPE_SIZE, chunk_m // tp_world_size))
-                block = tp_world_size * stripe
-
-                for block_start in range(0, chunk_m, block):
-                    local_off = block_start + tp_rank * stripe
-                    if local_off >= chunk_m:
-                        break
-                    local_m = min(stripe, chunk_m - local_off)
+            if any_m_split:
+                # Each rank takes one stripe from each half of the M range,
+                # mirrored so rank r pairs its cheap low-index stripe with an
+                # expensive high-index one. Causal cost grows with row index,
+                # so this leaves every rank ~M**2/2/tp of work rather than
+                # handing the last rank all the expensive rows.
+                for local_off, local_m in _m_split_stripes(
+                    chunk_m, tp_rank, tp_world_size
+                ):
                     local_start = chunk.token_start + local_off
                     local_end = local_start + local_m
                     logits = rocm_fp8_mqa_logits(
@@ -1473,9 +1525,6 @@ def rocm_aiter_sparse_attn_indexer(
                     topk_indices = topk_indices_buffer[
                         local_start:local_end, :topk_tokens
                     ]
-                    # A stripe can cover only a subset of rows from each
-                    # request, so localized top-k cannot reconstruct the
-                    # per-request logits windows safely here.
                     if rocm_aiter_ops.is_indexer_top_k_supported(
                         is_prefill=True,
                         compress_ratio=compress_ratio,
@@ -1502,7 +1551,6 @@ def rocm_aiter_sparse_attn_indexer(
                             topk_tokens,
                         )
             else:
-                # Keep the existing replicated path for unsupported batches.
                 logits = rocm_fp8_mqa_logits(
                     q_fp8[chunk.token_start : chunk.token_end],
                     (k_fp8, k_scale.view(torch.float32)),
@@ -1568,8 +1616,9 @@ def rocm_aiter_sparse_attn_indexer(
                         topk_tokens,
                     )
 
-        # AllReduce(MAX): unwritten positions = -1, MAX recovers full result
-        if use_m_split and tp_world_size > 1:
+        # Every row in this collective has exactly one writer, including
+        # short tail chunks. Other ranks retain the -1 sentinel.
+        if any_m_split:
             prefill_start = num_decode_tokens
             prefill_end = hidden_states.shape[0]
             buf_slice = topk_indices_buffer[prefill_start:prefill_end, :topk_tokens]
