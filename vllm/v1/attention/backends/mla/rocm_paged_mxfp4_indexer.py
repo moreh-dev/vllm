@@ -393,7 +393,10 @@ class RocmMxfp4IndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
         max_logits_bytes: int,
         request_offset: int = 0,
         fused_mqa_topk_eligible: bool = False,
+        m_split_world_size: int = 1,
     ) -> list[tuple[slice, slice]]:
+        # The paged MXFP4 indexer never stripes rows across TP ranks, so
+        # m_split_world_size must not widen the logits budget.
         return split_prefill_chunks(
             compressed_seq_lens_cpu,
             prefill_query_lens_cpu,
