@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+import functools
+
 import torch
 
 import vllm.envs as envs
@@ -41,6 +43,34 @@ logger = init_logger(__name__)
 
 _GFX950_KPOOL_AITER_MAX_POOLS = 256 * 1024  # (1M ctx)
 _GFX950_KPOOL_AITER_MIN_POOLS = 16 * 1024
+
+
+@functools.cache
+def _aiter_kpool_writers():
+    """aiter's HIP kpool cache writers ``(kpool_mixed_write, kpool_decode_update)``
+    when VLLM_ROCM_KPOOL_AITER_COMPRESS=1 on gfx950, else None (the Triton
+    writers below). Byte-identical output; the HIP kernels read the int64 slot
+    mappings and positions directly."""
+    if not envs.VLLM_ROCM_KPOOL_AITER_COMPRESS:
+        return None
+    from vllm.platforms.rocm import on_gfx950
+
+    if not (rocm_aiter_ops.is_enabled() and on_gfx950()):
+        logger.warning(
+            "VLLM_ROCM_KPOOL_AITER_COMPRESS=1 needs VLLM_ROCM_USE_AITER=1 on "
+            "gfx950; using the Triton kpool writers"
+        )
+        return None
+    try:
+        from aiter.ops.kpool_compress import kpool_decode_update, kpool_mixed_write
+    except ImportError:
+        logger.warning(
+            "VLLM_ROCM_KPOOL_AITER_COMPRESS=1 but this aiter has no "
+            "kpool_compress ops; using the Triton kpool writers"
+        )
+        return None
+    logger.info("kpool index cache written by aiter HIP kernels")
+    return kpool_mixed_write, kpool_decode_update
 
 # kpool write helper: form pools from the current token batch and compress them
 # into the index K cache via the fused Triton kernel.
@@ -245,30 +275,52 @@ def sparse_attn_indexer_kpool(
             if n_prefill > 0:
                 # decode tokens are batched first; prefill tokens follow.
                 prefill_slice = slice(num_decode_tokens, num_tokens)
-                _kpool_compress_insert(
-                    k[prefill_slice],
-                    gate_score[prefill_slice],
-                    compress_ape,
-                    kv_cache,
-                    slot_mapping[prefill_slice],
-                    index_kpool,
-                    head_dim,
-                    round_scale=(scale_fmt is not None),
-                )
                 # Persist each request's incomplete prefill pool so decode can
                 # finish it, including after PD transfer. Tail slots use
                 # ``pos % kpool`` within the request's tail block. Processing
                 # only the batch's trailing tokens would miss all but the last
                 # request in a multi-request prefill.
+                prefill_tail_slots = None
                 if tail_kv_cache is not None and tail_prefix is not None:
                     tail_meta = attn_metadata.get(_resolve_layer_name(tail_prefix))
                     if tail_meta is not None:
                         assert isinstance(tail_meta, DeepseekV32IndexerMetadata)
+                        prefill_tail_slots = tail_meta.slot_mapping[prefill_slice]
+                aiter_kpool = _aiter_kpool_writers()
+                if aiter_kpool is not None:
+                    # aiter HIP writer: the pool insert and the tail seeding in
+                    # one launch, K / gate rows read in place (no gathers).
+                    aiter_kpool[0](
+                        kv_cache,
+                        compress_ape,
+                        index_kpool,
+                        scale_fmt is not None,
+                        0,
+                        prefill_k=k[prefill_slice],
+                        prefill_gate=gate_score[prefill_slice],
+                        prefill_slot_mapping=slot_mapping[prefill_slice],
+                        prefill_tail_slot_mapping=prefill_tail_slots,
+                        tail_kv_cache=(
+                            tail_kv_cache if prefill_tail_slots is not None else None
+                        ),
+                    )
+                else:
+                    _kpool_compress_insert(
+                        k[prefill_slice],
+                        gate_score[prefill_slice],
+                        compress_ape,
+                        kv_cache,
+                        slot_mapping[prefill_slice],
+                        index_kpool,
+                        head_dim,
+                        round_scale=(scale_fmt is not None),
+                    )
+                    if prefill_tail_slots is not None:
                         kpool_ops.kpool_seed_tail_cache(
                             tail_kv_cache,
                             k[prefill_slice],
                             gate_score[prefill_slice],
-                            tail_meta.slot_mapping[prefill_slice],
+                            prefill_tail_slots,
                             index_kpool,
                             head_dim,
                         )
@@ -485,6 +537,11 @@ def sparse_attn_indexer_kpool(
                 use_uniform = not decode_metadata.requires_padding
                 group_lens = decode_metadata.decode_lens
                 lmax = int(decode_metadata.decode_lens.max().item())
+            aiter_kpool = _aiter_kpool_writers()
+            # The Triton kernel reads int32 positions; the aiter kernel reads
+            # all three metadata tensors in the slot mapping's dtype (int64),
+            # so nothing is converted on that path.
+            pos_dtype = slot_mapping.dtype if aiter_kpool is not None else torch.int32
             if not use_uniform:
                 # Non-uniform decode_lens (mixed plain-decode + spec-verify, or
                 # a variable MTP-verify batch): scatter actual tokens into a
@@ -512,7 +569,7 @@ def sparse_attn_indexer_kpool(
                     scatter_idx,
                 )
                 dec_pos = _scatter_decode_tokens_by_request(
-                    positions[:num_decode_tokens].to(torch.int32),
+                    positions[:num_decode_tokens].to(pos_dtype),
                     -1,
                     num_requests,
                     lmax,
@@ -524,7 +581,7 @@ def sparse_attn_indexer_kpool(
                 dec_k = k[:num_decode_tokens].view(*shape2, head_dim)
                 dec_gate = gate_score[:num_decode_tokens].view(*shape2, head_dim)
                 dec_slot = slot_mapping[:num_decode_tokens].view(shape2)
-                dec_pos = positions[:num_decode_tokens].to(torch.int32).view(shape2)
+                dec_pos = positions[:num_decode_tokens].to(pos_dtype).view(shape2)
             tail_meta = (
                 attn_metadata.get(_resolve_layer_name(tail_prefix))
                 if tail_prefix is not None
@@ -550,7 +607,22 @@ def sparse_attn_indexer_kpool(
                 dec_tail_slot = tail_meta.slot_mapping[:num_decode_tokens].view(shape2)
             # The compress kernel writes the raw fp8 cache (not the quant view);
             # pass the underlying kv_cache, not kv_cache_quant_view.
-            if dec_tail_slot is not None:
+            if dec_tail_slot is not None and aiter_kpool is not None:
+                # aiter HIP writer: one wave per request, same token order as
+                # the Triton walk (byte-identical cache and tail ring).
+                aiter_kpool[1](
+                    kv_cache_raw,
+                    tail_kv_cache,
+                    dec_tail_slot,
+                    dec_k,
+                    dec_gate,
+                    compress_ape,
+                    dec_slot,
+                    dec_pos,
+                    index_kpool,
+                    scale_fmt is not None,
+                )
+            elif dec_tail_slot is not None:
                 # Single batched launch over [num_requests, next_n] replaces the
                 # per-token sequential loop. The kernel iterates each request's
                 # tokens in position order internally, preserving the
