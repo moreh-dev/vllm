@@ -1530,7 +1530,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     use_cp_indexer,
                 )
 
-                if use_cp_indexer(max_prefill_seq_len):
+                if use_cp_indexer(max_prefill_seq_len, self.tp_size):
                     m_split_tp_size = self.tp_size
             # Upper bound is exact for prefill rows (the `[num_decodes:]`
             # slice below).
