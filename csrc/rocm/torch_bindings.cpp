@@ -101,6 +101,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("fp8_paged_mqa_logits", torch::kCUDA, &fp8_paged_mqa_logits);
 #endif  // VLLM_SKIP_FP8_MQA_LOGITS
 
+#ifndef VLLM_SKIP_SPARSE_MLA_FP8
+  // FP8 sparse MLA (GLM-5.x sparse attention core) with fused BF16 query
+  // conversion and BF16 output; gfx950, 64 heads x 512 latent dims.
+  rocm_ops.def(
+      "sparse_mla_fp8_fwd(Tensor q, Tensor kv_buffer, Tensor kv_indices, "
+      "Tensor! out, Tensor!? lse, Tensor! partial_o, Tensor! partial_lse, "
+      "float softmax_scale, float q_scale, float kv_scale) -> ()");
+  rocm_ops.impl("sparse_mla_fp8_fwd", torch::kCUDA, &sparse_mla_fp8_fwd);
+#endif  // VLLM_SKIP_SPARSE_MLA_FP8
+
 #ifdef VLLM_ROCM_GFX1100
   // MXFP4 weights x int8 activations GEMV for RDNA3/RDNA3.5 (gfx11) decode,
   // 1 <= M <= 8. Weights [N, K/2] uint8 E2M1, scales [N, K/32] uint8 E8M0.

@@ -150,6 +150,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_KPOOL_HIP_COMPRESS: bool = False
     VLLM_ROCM_HIP_FP8_MQA_LOGITS: bool = False
     VLLM_ROCM_HIP_FP8_PAGED_MQA_LOGITS: bool = False
+    VLLM_ROCM_HIP_SPARSE_MLA_FP8: bool = False
     VLLM_ROCM_AITER_MLA_ASM_PADDING: Literal["auto", "gluon", "asm"] = "auto"
     VLLM_ROCM_USE_AITER_MHA: bool = True
     VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA: bool = False
@@ -1359,6 +1360,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_HIP_FP8_PAGED_MQA_LOGITS": lambda: (
         os.getenv("VLLM_ROCM_HIP_FP8_PAGED_MQA_LOGITS", "False").lower()
         in ("true", "1")
+    ),
+    # Run the GLM-5.x sparse MLA attention core with the HIP FP8 sparse MLA
+    # kernel in _rocm_C (csrc/rocm/sparse_mla_fp8.cu): BF16 Q converted to FP8
+    # inside the kernel, FP8 latent KV, BF16 output. Needs gfx950, an fp8
+    # (e4m3) KV cache, 64 query heads per rank (TP1 or attention DP),
+    # kv_lora_rank 512 without RoPE, top-k <= 2176 and <= 16384 query rows per
+    # step; otherwise the backend keeps its aiter paths and says why.
+    "VLLM_ROCM_HIP_SPARSE_MLA_FP8": lambda: (
+        os.getenv("VLLM_ROCM_HIP_SPARSE_MLA_FP8", "False").lower() in ("true", "1")
     ),
     # Small-head (<16) AITER MLA decode kernel selection. Small head counts
     # (e.g. Kimi-K3: 12 heads/rank at TP8, 6 at TP16) can decode either through

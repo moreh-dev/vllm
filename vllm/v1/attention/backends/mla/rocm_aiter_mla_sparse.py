@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, ClassVar
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -292,6 +293,74 @@ def triton_convert_req_index_to_global_index(
 
 
 @triton.jit
+def _dense_global_index_kernel(
+    req_id_ptr,  # int32 [num_tokens]
+    block_table_ptr,  # int32 [num_requests, max_num_blocks_per_req]
+    token_indices_ptr,  # int32 [num_tokens, NUM_TOPK_TOKENS], -1 invalid
+    out_ptr,  # int32 [num_tokens, NUM_TOPK_TOKENS]
+    max_num_blocks_per_req,
+    bt_stride0,
+    bt_stride1,
+    ti_stride0,
+    ti_stride1,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_STRIDE_ROWS: tl.constexpr,
+    NUM_TOPK_TOKENS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    col = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = col < NUM_TOPK_TOKENS
+    req = tl.load(req_id_ptr + token_id)
+    tok = tl.load(
+        token_indices_ptr + token_id * ti_stride0 + col * ti_stride1, mask=mask, other=-1
+    )
+    block_id = tok // BLOCK_SIZE
+    inblock_off = tok % BLOCK_SIZE
+    valid = (tok >= 0) & (block_id < max_num_blocks_per_req)
+    base = tl.load(
+        block_table_ptr + req * bt_stride0 + block_id * bt_stride1,
+        mask=valid & mask,
+        other=0,
+    )
+    out_val = tl.where(valid, base * BLOCK_STRIDE_ROWS + inblock_off, -1)
+    tl.store(out_ptr + token_id * NUM_TOPK_TOKENS + col, out_val, mask=mask)
+
+
+def triton_dense_global_indices(
+    req_id: torch.Tensor,  # int32 [num_tokens]
+    block_table: torch.Tensor,  # int32 [num_requests, max_num_blocks_per_req]
+    token_indices: torch.Tensor,  # int32 [num_tokens, topk], -1 invalid
+    out: torch.Tensor,  # int32 [num_tokens, topk]
+    block_size: int,
+    block_stride_rows: int,
+) -> None:
+    """Dense counterpart of triton_convert_req_index_to_global_index for the
+    HIP FP8 sparse MLA kernel: every entry keeps its column and an invalid
+    top-k entry stays -1 (the kernel masks negative ids) instead of being
+    compacted away."""
+    num_tokens, topk = token_indices.shape
+    if num_tokens == 0:
+        return
+    block_n = min(128, triton.next_power_of_2(topk))
+    _dense_global_index_kernel[(num_tokens, triton.cdiv(topk, block_n))](
+        req_id,
+        block_table,
+        token_indices,
+        out,
+        block_table.shape[1],
+        block_table.stride(0),
+        block_table.stride(1),
+        token_indices.stride(0),
+        token_indices.stride(1),
+        BLOCK_SIZE=block_size,
+        BLOCK_STRIDE_ROWS=block_stride_rows,
+        NUM_TOPK_TOKENS=topk,
+        BLOCK_N=block_n,
+    )
+
+
+@triton.jit
 def generate_sparse_seqlen_kernel(
     seq_len_ptr,  # [num_seq]
     cu_query_lens_ptr,  # [num_seq]
@@ -423,6 +492,9 @@ class ROCMAiterMLASparseMetadata(SparseMLACommonMetadata):
     # Source buffer and index_epoch of paged_kv_indices; -1 before any remap.
     remapped_buf: object = None
     remapped_epoch: int = -1
+    # Dense [num_tokens, topk] global slot ids with -1 for invalid entries, for
+    # the HIP FP8 sparse MLA kernel; written by the layer that remaps.
+    hip_dense_kv_indices: torch.Tensor | None = None
 
     # Persistent MLA metadata (only populated when persistent mode is enabled,
     # i.e. when the aiter sparse decode kernel supports work-stealing splits).
@@ -779,6 +851,7 @@ def reference_mla_sparse_prefill(
 class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
     supports_dcp = False
     use_aiter_sparse_mla = False
+    use_hip_sparse_mla_fp8 = False
 
     def __init__(
         self,
@@ -855,6 +928,25 @@ class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
                     reason,
                 )
 
+        # HIP FP8 sparse MLA (csrc/rocm/sparse_mla_fp8.cu): BF16 Q converted
+        # inside the kernel, FP8 latent KV, BF16 output. Takes precedence over
+        # the aiter paths when it applies.
+        self._hip_dense_kv_indices: torch.Tensor | None = None
+        if envs.VLLM_ROCM_HIP_SPARSE_MLA_FP8:
+            reason = self._hip_sparse_mla_fp8_unsupported_reason(vllm_config)
+            if reason is None:
+                self.use_hip_sparse_mla_fp8 = True
+                logger.info_once(
+                    "sparse MLA attention computed by the HIP FP8 sparse MLA "
+                    "kernel (fused BF16 query conversion, BF16 output)"
+                )
+            else:
+                logger.warning_once(
+                    "VLLM_ROCM_HIP_SPARSE_MLA_FP8 is set, but %s; using the "
+                    "default sparse MLA path instead.",
+                    reason,
+                )
+
     def _aiter_sparse_mla_unsupported_reason(
         self, vllm_config: VllmConfig
     ) -> str | None:
@@ -868,6 +960,106 @@ class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
         if self.dcp_world_size > 1 or self.pcp_world_size > 1:
             return "context parallelism is not supported"
         return None
+
+    def _hip_sparse_mla_fp8_unsupported_reason(
+        self, vllm_config: VllmConfig
+    ) -> str | None:
+        from vllm.platforms.rocm import on_gfx950
+
+        if not on_gfx950():
+            return "the HIP FP8 sparse MLA kernel is gfx950-only"
+        if not (
+            hasattr(torch.ops, "_rocm_C")
+            and hasattr(torch.ops._rocm_C, "sparse_mla_fp8_fwd")
+        ):
+            return "_rocm_C was built without sparse_mla_fp8_fwd"
+        model_dtype = vllm_config.model_config.dtype
+        if model_dtype != torch.bfloat16:
+            return f"the model dtype is {model_dtype}, not bfloat16"
+        if self.kv_cache_dtype not in ("fp8", "fp8_e4m3"):
+            return (
+                f"kv-cache dtype {self.kv_cache_dtype!r} is not e4m3 fp8 (the "
+                "kernel reads an FP8 latent cache; serve with --kv-cache-dtype fp8)"
+            )
+        if self.num_heads != 64:
+            return (
+                f"{self.num_heads} query heads per rank, the kernel needs 64 "
+                "(all heads on one rank: TP1 or attention data parallelism)"
+            )
+        if self.kv_lora_rank != 512 or self.qk_rope_head_dim != 0:
+            return (
+                f"kv_lora_rank {self.kv_lora_rank} / qk_rope_head_dim "
+                f"{self.qk_rope_head_dim}, the kernel needs 512 / 0"
+            )
+        if self.sinks is not None:
+            return "attention sinks are not supported"
+        if self.dcp_world_size > 1 or self.pcp_world_size > 1:
+            return "context parallelism is not supported"
+        topk_tokens = vllm_config.model_config.hf_text_config.index_topk
+        if topk_tokens > ops.SPARSE_MLA_FP8_MAX_CAPACITY:
+            return (
+                f"top-k {topk_tokens} exceeds the kernel's "
+                f"{ops.SPARSE_MLA_FP8_MAX_CAPACITY} ids per row"
+            )
+        return None
+
+    def _hip_dense_indices_buffer(self, num_tokens: int, topk_tokens: int) -> torch.Tensor:
+        needed = num_tokens * topk_tokens
+        buf = self._hip_dense_kv_indices
+        if buf is None or buf.numel() < needed:
+            buf = torch.empty(
+                (max(needed, 1),),
+                dtype=torch.int32,
+                device=self.topk_indices_buffer.device,
+            )
+            self._hip_dense_kv_indices = buf
+        return buf[:needed].view(num_tokens, topk_tokens)
+
+    def _forward_mla_hip_fp8(
+        self,
+        layer: AttentionLayer,
+        q: torch.Tensor,  # [sq, 64, 512] bf16 or fp8, not head-padded
+        kv_rows: torch.Tensor,  # flat [rows, 512] fp8 view of the latent cache
+        attn_metadata: ROCMAiterMLASparseMetadata,
+    ) -> torch.Tensor:
+        """_forward_mla on the HIP FP8 sparse MLA kernel: BF16 q is encoded to
+        FP8 inside the kernel (q_scale), the dense -1-masked slot ids come from
+        the remap above, and the launch depends on shapes only, so it is
+        CUDA-graph capturable."""
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        scales = getattr(layer, "_hip_sparse_mla_fp8_scales", None)
+        if scales is None:
+            # Static per-tensor scales: read once per layer, outside capture.
+            scales = (float(layer._q_scale.item()), float(layer._k_scale.item()))
+            layer._hip_sparse_mla_fp8_scales = scales
+        q_scale, kv_scale = scales
+        output = torch.empty(
+            [q.shape[0], self.num_heads, self.kv_lora_rank],
+            dtype=attn_metadata.attn_out_dtype,
+            device=q.device,
+        )
+        rows = ops.sparse_mla_fp8_workspace_rows(num_actual_tokens)
+        if rows:
+            workspace = current_workspace_manager().get_simultaneous(
+                ((rows * 512,), torch.bfloat16), ((rows,), torch.float32)
+            )
+        else:
+            workspace = (
+                torch.empty((0,), dtype=torch.bfloat16, device=q.device),
+                torch.empty((0,), dtype=torch.float32, device=q.device),
+            )
+        assert attn_metadata.hip_dense_kv_indices is not None
+        ops.sparse_mla_fp8_fwd(
+            q[:num_actual_tokens],
+            kv_rows,
+            attn_metadata.hip_dense_kv_indices[:num_actual_tokens],
+            self.scale,
+            q_scale=q_scale,
+            kv_scale=kv_scale,
+            out=output[:num_actual_tokens],
+            workspace=workspace,
+        )
+        return output
 
     def record_logical_topk_ready(self) -> None:
         # This impl shares the top-k indices buffer via SharedTopkIndicesBuffer
@@ -1210,6 +1402,30 @@ class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
             )
             attn_metadata.remapped_buf = self.topk_indices_buffer
             attn_metadata.remapped_epoch = self.index_epoch
+            if self.use_hip_sparse_mla_fp8:
+                dense = self._hip_dense_indices_buffer(
+                    num_actual_toks, attn_metadata.topk_tokens
+                )
+                triton_dense_global_indices(
+                    attn_metadata.req_id_per_token[:num_actual_toks],
+                    attn_metadata.block_table,
+                    topk_indices,
+                    dense,
+                    attn_metadata.block_size,
+                    block_stride_rows,
+                )
+                attn_metadata.hip_dense_kv_indices = dense
+
+        if (
+            self.use_hip_sparse_mla_fp8
+            and num_actual_toks <= ops.SPARSE_MLA_FP8_MAX_QUERIES
+            and attn_metadata.hip_dense_kv_indices is not None
+        ):
+            # BF16 q goes in as is (the kernel encodes it); an already fp8 q
+            # from the decode concat-quant op is used directly.
+            kv_rows = kv_c_and_k_pe_cache.view(current_platform.fp8_dtype())
+            output = self._forward_mla_hip_fp8(layer, q, kv_rows, attn_metadata)
+            return output, None
 
         # write the latent and rope to kv cache
         if fp8_attention:

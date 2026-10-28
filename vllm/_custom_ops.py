@@ -2395,6 +2395,90 @@ def fp8_paged_mqa_logits(
     return out
 
 
+# FP8 sparse MLA with fused BF16 query conversion (csrc/rocm/sparse_mla_fp8.cu,
+# gfx950, 64 heads x 512 latent dims, no appended RoPE): the GLM-5.x sparse
+# attention core over the shared FP8 latent pool.
+SPARSE_MLA_FP8_MAX_QUERIES = 16384
+SPARSE_MLA_FP8_MAX_CAPACITY = 2176
+
+
+def sparse_mla_fp8_split_count(queries: int) -> int:
+    """KV splits of the kernel's dispatch for ``queries`` rows (sizes the
+    workspace; the layout itself is private to the kernel)."""
+    for limit, splits in ((6, 17), (12, 9), (21, 6), (23, 4), (42, 6), (64, 4), (128, 2)):
+        if queries <= limit:
+            return splits
+    return 1
+
+
+def sparse_mla_fp8_workspace_rows(queries: int) -> int:
+    splits = sparse_mla_fp8_split_count(queries)
+    return queries * splits * 64 if splits > 1 else 0
+
+
+def sparse_mla_fp8_workspace(
+    queries: int, device: torch.device | str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Opaque split workspace (BF16 partial O, FP32 partial LSE) for
+    ``sparse_mla_fp8_fwd`` with ``queries`` rows; needs no initialization."""
+    rows = sparse_mla_fp8_workspace_rows(queries)
+    return (
+        torch.empty((rows * 512,), dtype=torch.bfloat16, device=device),
+        torch.empty((rows,), dtype=torch.float32, device=device),
+    )
+
+
+def sparse_mla_fp8_fwd(
+    q: torch.Tensor,  # [Q, 64, 512] bf16 (encoded as q / q_scale inside) or float8_e4m3fn
+    kv_buffer: torch.Tensor,  # float8_e4m3fn [slots, 512], [pages, page, 512] or [slots, 1, 1, 512]
+    kv_indices: torch.Tensor,  # int32 [Q, K] or [Q, 1, K]: physical slot ids, < 0 masked
+    softmax_scale: float,
+    *,
+    q_scale: float = 1.0,
+    kv_scale: float = 1.0,
+    out: torch.Tensor | None = None,
+    lse: torch.Tensor | None = None,
+    return_lse: bool = False,
+    workspace: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """O = softmax(softmax_scale * Q . KV[ids]^T) . KV[ids] with FP8 Q / K / V
+    (decoding scales ``q_scale`` / ``kv_scale``), FP8 P, FP32 accumulation and
+    BF16 output; Q <= 16384 rows, K <= 2176 ids per row. Empty rows give O = 0
+    and LSE = -inf. Writes ``out`` ([Q, 64, 512] bf16) and the optional ``lse``
+    ([Q, 64] fp32, natural log) when given; the workspace comes from
+    ``sparse_mla_fp8_workspace(Q, device)``. Dispatch depends on shapes only,
+    so a warmed call is CUDA-graph capturable.
+    """
+    if kv_buffer.ndim == 4 and kv_buffer.shape[1:3] == (1, 1):
+        kv_buffer = kv_buffer.view(kv_buffer.shape[0], kv_buffer.shape[-1])
+    elif kv_buffer.ndim == 3:
+        kv_buffer = kv_buffer.view(-1, kv_buffer.shape[-1])
+    if kv_indices.ndim == 3 and kv_indices.shape[1] == 1:
+        kv_indices = kv_indices.view(kv_indices.shape[0], kv_indices.shape[2])
+    if out is None:
+        out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
+    if lse is not None and not return_lse:
+        raise ValueError("supplying lse requires return_lse=True")
+    if return_lse and lse is None:
+        lse = torch.empty(q.shape[:2], dtype=torch.float32, device=q.device)
+    if workspace is None:
+        workspace = sparse_mla_fp8_workspace(q.shape[0], q.device)
+    partial_o, partial_lse = workspace
+    torch.ops._rocm_C.sparse_mla_fp8_fwd(
+        q,
+        kv_buffer,
+        kv_indices,
+        out,
+        lse,
+        partial_o,
+        partial_lse,
+        float(softmax_scale),
+        float(q_scale),
+        float(kv_scale),
+    )
+    return out, lse
+
+
 # moe
 def moe_sum(
     input: torch.Tensor,

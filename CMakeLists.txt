@@ -1729,9 +1729,35 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
       $<$<COMPILE_LANGUAGE:${VLLM_GPU_LANG}>:${VLLM_ROCM_EXT_FLAGS};-fno-honor-nans;-Wno-unused-variable>)
     target_compile_definitions(_rocm_C_fp8_paged_mqa PRIVATE "-DTORCH_EXTENSION_NAME=_rocm_C")
     target_link_libraries(_rocm_C_fp8_paged_mqa PRIVATE torch)
+
+    # sparse_mla_fp8 (the FP8 sparse MLA attention core with fused BF16 Q
+    # conversion, csrc/rocm/sparse_mla_fp8/) is gfx950-only as well. Its four
+    # kernel families are separate translation units, as in the aiter JIT
+    # module; -fno-gpu-flush-denormals-to-zero keeps the gradual underflow of
+    # the FP8 encode that its numerical contract documents.
+    set(VLLM_SPARSE_MLA_FP8_SRC
+      "csrc/rocm/sparse_mla_fp8.cu"
+      "csrc/rocm/sparse_mla_fp8/small.cu"
+      "csrc/rocm/sparse_mla_fp8/prefetch.cu"
+      "csrc/rocm/sparse_mla_fp8/rotating.cu"
+      "csrc/rocm/sparse_mla_fp8/streaming.cu")
+    hipify_sources_target(VLLM_SPARSE_MLA_FP8_HIP_SRCS _rocm_C_sparse_mla_fp8 "${VLLM_SPARSE_MLA_FP8_SRC}")
+    unset(_VLLM_LAST_HIPIFY_TARGET)
+    add_library(_rocm_C_sparse_mla_fp8 OBJECT ${VLLM_SPARSE_MLA_FP8_HIP_SRCS})
+    add_dependencies(_rocm_C_sparse_mla_fp8 hipify_all)
+    set_source_files_properties(${VLLM_SPARSE_MLA_FP8_HIP_SRCS} PROPERTIES LANGUAGE ${VLLM_GPU_LANG})
+    set_target_properties(_rocm_C_sparse_mla_fp8 PROPERTIES
+      ${VLLM_GPU_LANG}_ARCHITECTURES "${VLLM_FP8_MQA_ARCHES}"
+      POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(_rocm_C_sparse_mla_fp8 PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/csrc)
+    target_compile_options(_rocm_C_sparse_mla_fp8 PRIVATE
+      $<$<COMPILE_LANGUAGE:${VLLM_GPU_LANG}>:${VLLM_ROCM_EXT_FLAGS};-fno-gpu-flush-denormals-to-zero;-Wno-unused-variable>)
+    target_compile_definitions(_rocm_C_sparse_mla_fp8 PRIVATE "-DTORCH_EXTENSION_NAME=_rocm_C")
+    target_link_libraries(_rocm_C_sparse_mla_fp8 PRIVATE torch)
   else()
     message(STATUS "No gfx950 in the arch list, skipping fp8_mqa_logits / fp8_paged_mqa_logits")
     list(APPEND VLLM_ROCM_EXT_FLAGS "-DVLLM_SKIP_FP8_MQA_LOGITS")
+    list(APPEND VLLM_ROCM_EXT_FLAGS "-DVLLM_SKIP_SPARSE_MLA_FP8")
   endif()
 
   set(VLLM_ROCM_HAS_GFX1100 OFF)
@@ -1767,9 +1793,9 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   endif()
 
   if(TARGET _rocm_C_fp8_mqa)
-    target_link_libraries(_rocm_C PRIVATE _rocm_C_fp8_mqa _rocm_C_fp8_paged_mqa)
+    target_link_libraries(_rocm_C PRIVATE _rocm_C_fp8_mqa _rocm_C_fp8_paged_mqa _rocm_C_sparse_mla_fp8)
   else()
-    target_compile_definitions(_rocm_C PRIVATE VLLM_SKIP_FP8_MQA_LOGITS)
+    target_compile_definitions(_rocm_C PRIVATE VLLM_SKIP_FP8_MQA_LOGITS VLLM_SKIP_SPARSE_MLA_FP8)
   endif()
 
   if(VLLM_ROCM_HAS_GFX1100)

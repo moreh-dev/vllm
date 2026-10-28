@@ -136,3 +136,18 @@ void fp8_paged_mqa_logits(const torch::Tensor& q_fp8,
                           int64_t split_kv, int64_t num_warps,
                           int64_t total_cu_count, int64_t rows_per_block);
 #endif  // VLLM_SKIP_FP8_MQA_LOGITS
+
+// FP8 sparse MLA with fused BF16 query conversion and BF16 output
+// (csrc/rocm/sparse_mla_fp8.cu, gfx950 only, 64 heads x 512 latent dims, no
+// appended RoPE): O[q] = softmax(scale * Q[q] . KV[ids[q]]^T) . KV[ids[q]] over
+// the flat FP8 pool kv_buffer [slots, 512] addressed by kv_indices [Q, K]
+// (negative / out-of-range ids masked, K <= 2176, Q <= 16384). q is BF16
+// (encoded as Q / q_scale inside) or FP8; partial_o / partial_lse is the
+// opaque split workspace of vllm._custom_ops.sparse_mla_fp8_workspace.
+#ifndef VLLM_SKIP_SPARSE_MLA_FP8
+void sparse_mla_fp8_fwd(const torch::Tensor& q, const torch::Tensor& kv_buffer,
+                        const torch::Tensor& kv_indices, torch::Tensor& out,
+                        std::optional<torch::Tensor> lse,
+                        torch::Tensor& partial_o, torch::Tensor& partial_lse,
+                        double softmax_scale, double q_scale, double kv_scale);
+#endif  // VLLM_SKIP_SPARSE_MLA_FP8
