@@ -755,6 +755,41 @@ def _accepts_parameters(function: Callable, required: set[str]) -> bool:
     )
 
 
+# The HIP decode logits kernel takes over from the aiter one only at this many
+# sequences per step and above; smaller decode batches keep the aiter path.
+_HIP_PAGED_MQA_LOGITS_MIN_BATCH = 16
+
+
+@functools.cache
+def _hip_fp8_paged_mqa_logits_enabled() -> bool:
+    """VLLM_ROCM_HIP_FP8_PAGED_MQA_LOGITS=1 on gfx950 with a _rocm_C that
+    carries the kernel; the batch-size / shape / layout gate is at the call
+    site (batches below _HIP_PAGED_MQA_LOGITS_MIN_BATCH stay on aiter)."""
+    if not envs.VLLM_ROCM_HIP_FP8_PAGED_MQA_LOGITS:
+        return False
+    if not _ON_GFX950:
+        logger.warning(
+            "VLLM_ROCM_HIP_FP8_PAGED_MQA_LOGITS=1 needs gfx950; using the aiter "
+            "paged-MQA logits path"
+        )
+        return False
+    if not (
+        hasattr(torch.ops, "_rocm_C")
+        and hasattr(torch.ops._rocm_C, "fp8_paged_mqa_logits")
+    ):
+        logger.warning(
+            "VLLM_ROCM_HIP_FP8_PAGED_MQA_LOGITS=1 but _rocm_C was built without "
+            "fp8_paged_mqa_logits; using the aiter paged-MQA logits path"
+        )
+        return False
+    logger.info(
+        "indexer decode logits computed by the HIP fp8_paged_mqa_logits kernel "
+        "for decode batches >= %d sequences",
+        _HIP_PAGED_MQA_LOGITS_MIN_BATCH,
+    )
+    return True
+
+
 def rocm_fp8_paged_mqa_logits(
     q_fp8: torch.Tensor,
     kv_cache_fp8: torch.Tensor,
@@ -806,6 +841,34 @@ def rocm_fp8_paged_mqa_logits(
         # Non 64-aligned page size (not used in prod): eager torch ref.
         return fp8_paged_mqa_logits_torch(
             q_fp8, kv_cache_fp8, weights, context_lens, block_tables, max_model_len
+        )
+
+    if (
+        _hip_fp8_paged_mqa_logits_enabled()
+        and batch_size >= _HIP_PAGED_MQA_LOGITS_MIN_BATCH
+        and q_fp8.dtype == torch.float8_e4m3fn
+        and q_fp8.shape[2] == 32
+        and q_fp8.shape[3] == 128
+        and block_size in (1, 64)
+        and kv_cache_fp8.shape[-1] == 132
+    ):
+        from vllm import _custom_ops as ops
+
+        (out_logits,) = current_workspace_manager().get_simultaneous(
+            ((batch_size * next_n, max_model_len), torch.float32),
+        )
+        # (B, next_n) lengths are consumed per row; a (B, 1) table with
+        # next_n > 1 is one length per sequence, the [B] form of the kernel.
+        if context_lens.dim() == 2 and context_lens.shape[1] != next_n:
+            context_lens = context_lens[:, -1]
+        return ops.fp8_paged_mqa_logits(
+            q_fp8,
+            kv_cache_fp8,
+            weights,
+            context_lens.contiguous(),
+            block_tables,
+            max_model_len,
+            out=out_logits,
         )
 
     aiter_paged_mqa_logits_module = None

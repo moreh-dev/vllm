@@ -119,4 +119,20 @@ void fp8_mqa_logits(const torch::Tensor& q_fp8, const torch::Tensor& k_fp8,
                     const torch::Tensor& cu_seqlen_ke, torch::Tensor& out,
                     int64_t split_n, int64_t num_warps, int64_t total_cu_count,
                     bool clean_logits, int64_t reverse_rows);
+
+// GLM-5.x / DeepSeek-V3.2 lightning-indexer decode logits over the paged fp8
+// indexer cache (csrc/rocm/fp8_paged_mqa_logits.cu, gfx950 only, n_heads=32,
+// head_dim=128, block_size 1 plain or 64 preshuffled). Writes only the causal
+// window of each row: p <= context_lens[b] - next_n + n ([batch] lengths) or
+// p < context_lens[b, n] ([batch, next_n] lengths); the rest of `out` is the
+// caller's. chunk_k / split_kv / num_warps / total_cu_count / rows_per_block
+// <= 0 select the host heuristics.
+void fp8_paged_mqa_logits(const torch::Tensor& q_fp8,
+                          const torch::Tensor& kv_cache_fp8,
+                          const torch::Tensor& weights,
+                          const torch::Tensor& context_lens,
+                          const torch::Tensor& block_tables, torch::Tensor& out,
+                          int64_t max_model_len, int64_t chunk_k,
+                          int64_t split_kv, int64_t num_warps,
+                          int64_t total_cu_count, int64_t rows_per_block);
 #endif  // VLLM_SKIP_FP8_MQA_LOGITS

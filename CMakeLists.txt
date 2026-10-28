@@ -1676,9 +1676,11 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     list(APPEND VLLM_ROCM_EXT_FLAGS "-DVLLM_SKIP_KPOOL_COMPRESS")
   endif()
 
-  # fp8_mqa_logits.cu (GLM-5.x lightning-indexer prefill logits) is a gfx950
-  # kernel (v_mfma_f32_32x32x64_f8f6f4, v_permlane32_swap): build it for gfx950
-  # only, in its own object library because it needs its own codegen flags:
+  # fp8_mqa_logits.cu (GLM-5.x lightning-indexer prefill logits) and
+  # fp8_paged_mqa_logits.cu (its decode half) are gfx950 kernels
+  # (v_mfma_f32_32x32x64_f8f6f4, v_permlane32_swap): build them for gfx950
+  # only, each in its own object library because they need their own codegen
+  # flags (prefill:):
   #   -fno-honor-nans               relu = single v_max (no IEEE canonicalize)
   #   -fno-slp-vectorize            keep the epilogue scalar (SLP re-packs the
   #                                 fma pairs into v_pk_fma, which cannot
@@ -1688,8 +1690,8 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   #   -Wno-unused-variable          the device code is kept verbatim from the
   #                                 aiter version, which leaves a few unused
   #                                 constants (-Werror=unused-variable otherwise)
-  # Without gfx950 in the arch list the op is not registered
-  # (VLLM_SKIP_FP8_MQA_LOGITS) and vLLM keeps its Triton / aiter logits path.
+  # Without gfx950 in the arch list neither op is registered
+  # (VLLM_SKIP_FP8_MQA_LOGITS) and vLLM keeps its Triton / aiter logits paths.
   set(VLLM_FP8_MQA_ARCHES ${VLLM_GPU_ARCHES})
   list(FILTER VLLM_FP8_MQA_ARCHES INCLUDE REGEX "gfx950")
   if(VLLM_FP8_MQA_ARCHES)
@@ -1708,8 +1710,27 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
       $<$<COMPILE_LANGUAGE:${VLLM_GPU_LANG}>:${VLLM_ROCM_EXT_FLAGS};-fno-honor-nans;-fno-slp-vectorize;-mllvm;-disable-machine-sink;-Wno-unused-variable>)
     target_compile_definitions(_rocm_C_fp8_mqa PRIVATE "-DTORCH_EXTENSION_NAME=_rocm_C")
     target_link_libraries(_rocm_C_fp8_mqa PRIVATE torch)
+
+    # fp8_paged_mqa_logits.cu (the decode half of the same indexer, paged fp8
+    # cache) is gfx950-only too but wants only -fno-honor-nans: its own object
+    # library, so the prefill kernel's -fno-slp-vectorize / -disable-machine-sink
+    # do not change its codegen.
+    set(VLLM_FP8_PAGED_MQA_SRC "csrc/rocm/fp8_paged_mqa_logits.cu")
+    hipify_sources_target(VLLM_FP8_PAGED_MQA_HIP_SRCS _rocm_C_fp8_paged_mqa "${VLLM_FP8_PAGED_MQA_SRC}")
+    unset(_VLLM_LAST_HIPIFY_TARGET)
+    add_library(_rocm_C_fp8_paged_mqa OBJECT ${VLLM_FP8_PAGED_MQA_HIP_SRCS})
+    add_dependencies(_rocm_C_fp8_paged_mqa hipify_all)
+    set_source_files_properties(${VLLM_FP8_PAGED_MQA_HIP_SRCS} PROPERTIES LANGUAGE ${VLLM_GPU_LANG})
+    set_target_properties(_rocm_C_fp8_paged_mqa PROPERTIES
+      ${VLLM_GPU_LANG}_ARCHITECTURES "${VLLM_FP8_MQA_ARCHES}"
+      POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(_rocm_C_fp8_paged_mqa PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/csrc)
+    target_compile_options(_rocm_C_fp8_paged_mqa PRIVATE
+      $<$<COMPILE_LANGUAGE:${VLLM_GPU_LANG}>:${VLLM_ROCM_EXT_FLAGS};-fno-honor-nans;-Wno-unused-variable>)
+    target_compile_definitions(_rocm_C_fp8_paged_mqa PRIVATE "-DTORCH_EXTENSION_NAME=_rocm_C")
+    target_link_libraries(_rocm_C_fp8_paged_mqa PRIVATE torch)
   else()
-    message(STATUS "No gfx950 in the arch list, skipping fp8_mqa_logits")
+    message(STATUS "No gfx950 in the arch list, skipping fp8_mqa_logits / fp8_paged_mqa_logits")
     list(APPEND VLLM_ROCM_EXT_FLAGS "-DVLLM_SKIP_FP8_MQA_LOGITS")
   endif()
 
@@ -1746,7 +1767,7 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   endif()
 
   if(TARGET _rocm_C_fp8_mqa)
-    target_link_libraries(_rocm_C PRIVATE _rocm_C_fp8_mqa)
+    target_link_libraries(_rocm_C PRIVATE _rocm_C_fp8_mqa _rocm_C_fp8_paged_mqa)
   else()
     target_compile_definitions(_rocm_C PRIVATE VLLM_SKIP_FP8_MQA_LOGITS)
   endif()

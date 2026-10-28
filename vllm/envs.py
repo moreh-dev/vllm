@@ -149,6 +149,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_MLA: bool = True
     VLLM_ROCM_KPOOL_HIP_COMPRESS: bool = False
     VLLM_ROCM_HIP_FP8_MQA_LOGITS: bool = False
+    VLLM_ROCM_HIP_FP8_PAGED_MQA_LOGITS: bool = False
     VLLM_ROCM_AITER_MLA_ASM_PADDING: Literal["auto", "gluon", "asm"] = "auto"
     VLLM_ROCM_USE_AITER_MHA: bool = True
     VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA: bool = False
@@ -1349,6 +1350,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # fp8 K cache only; other shapes keep the existing path.
     "VLLM_ROCM_HIP_FP8_MQA_LOGITS": lambda: (
         os.getenv("VLLM_ROCM_HIP_FP8_MQA_LOGITS", "False").lower() in ("true", "1")
+    ),
+    # Compute the GLM-5.x sparse-indexer decode logits over the paged fp8
+    # indexer cache with the HIP fp8_paged_mqa_logits kernel in _rocm_C
+    # (csrc/rocm/fp8_paged_mqa_logits.cu) instead of the aiter Triton kernel
+    # for decode batches of >= 16 sequences (smaller batches stay on aiter).
+    # gfx950, n_heads=32, head_dim=128, fp8 cache with block_size 1 or 64 only.
+    "VLLM_ROCM_HIP_FP8_PAGED_MQA_LOGITS": lambda: (
+        os.getenv("VLLM_ROCM_HIP_FP8_PAGED_MQA_LOGITS", "False").lower()
+        in ("true", "1")
     ),
     # Small-head (<16) AITER MLA decode kernel selection. Small head counts
     # (e.g. Kimi-K3: 12 heads/rank at TP8, 6 at TP16) can decode either through

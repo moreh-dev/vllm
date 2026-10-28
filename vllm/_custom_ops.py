@@ -2346,6 +2346,55 @@ def fp8_mqa_logits(
     return out
 
 
+def fp8_paged_mqa_logits(
+    q_fp8: torch.Tensor,  # [B, next_n, 32, 128] float8_e4m3fn
+    kv_cache_fp8: torch.Tensor,  # [blocks, block_size, 1, 132] uint8, block_size 1 / 64
+    weights: torch.Tensor,  # [B * next_n, 32] fp32
+    context_lens: torch.Tensor,  # [B] or [B, next_n] int32
+    block_tables: torch.Tensor,  # [B, max_blocks] int32
+    max_model_len: int,
+    *,
+    out: torch.Tensor | None = None,
+    chunk_k: int = 0,
+    split_kv: int = 0,
+    num_warps: int = 0,
+    total_cu_count: int = 0,
+    rows_per_block: int = 0,
+) -> torch.Tensor:
+    """GLM-5.x lightning-indexer decode logits over the paged fp8 indexer cache
+    (csrc/rocm/fp8_paged_mqa_logits.cu, gfx950, n_heads=32, head_dim=128):
+
+        out[m, p] = sum_h relu(q[m,h,:] . k[p,:]) * weights[m,h] * kv_scale[p]
+
+    Only the causal window of each row is written: p <= context_lens[b] -
+    next_n + n for [B] lengths, p < context_lens[b, n] for [B, next_n] ones;
+    the rest of ``out`` is left as is (the top-k consumers are range aware).
+    Writes into ``out`` when given, else allocates [B * next_n, max_model_len]
+    fp32. The tunables <= 0 select the host heuristics (fitted on MI355X).
+    """
+    if out is None:
+        out = torch.empty(
+            (q_fp8.shape[0] * q_fp8.shape[1], max_model_len),
+            dtype=torch.float32,
+            device=q_fp8.device,
+        )
+    torch.ops._rocm_C.fp8_paged_mqa_logits(
+        q_fp8,
+        kv_cache_fp8,
+        weights,
+        context_lens,
+        block_tables,
+        out,
+        max_model_len,
+        chunk_k,
+        split_kv,
+        num_warps,
+        total_cu_count,
+        rows_per_block,
+    )
+    return out
+
+
 # moe
 def moe_sum(
     input: torch.Tensor,

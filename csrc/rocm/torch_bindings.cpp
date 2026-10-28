@@ -90,6 +90,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "int split_n, int num_warps, int total_cu_count, bool clean_logits, "
       "int reverse_rows) -> ()");
   rocm_ops.impl("fp8_mqa_logits", torch::kCUDA, &fp8_mqa_logits);
+
+  // GLM-5.x lightning-indexer decode logits over the paged fp8 indexer cache
+  // (gfx950, n_heads=32, head_dim=128, block_size 1 or 64).
+  rocm_ops.def(
+      "fp8_paged_mqa_logits(Tensor q_fp8, Tensor kv_cache_fp8, Tensor weights, "
+      "Tensor context_lens, Tensor block_tables, Tensor! out, "
+      "int max_model_len, int chunk_k, int split_kv, int num_warps, "
+      "int total_cu_count, int rows_per_block) -> ()");
+  rocm_ops.impl("fp8_paged_mqa_logits", torch::kCUDA, &fp8_paged_mqa_logits);
 #endif  // VLLM_SKIP_FP8_MQA_LOGITS
 
 #ifdef VLLM_ROCM_GFX1100
