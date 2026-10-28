@@ -940,6 +940,30 @@ def mqa_logits_module():
     return None
 
 
+@functools.cache
+def _hip_fp8_mqa_logits_enabled() -> bool:
+    """VLLM_ROCM_HIP_FP8_MQA_LOGITS=1 on gfx950 with a _rocm_C that carries the
+    kernel (n_heads=32, head_dim=128 are checked by the kernel itself)."""
+    if not envs.VLLM_ROCM_HIP_FP8_MQA_LOGITS:
+        return False
+    if not _ON_GFX950:
+        logger.warning(
+            "VLLM_ROCM_HIP_FP8_MQA_LOGITS=1 needs gfx950; using the aiter "
+            "fp8_mqa_logits path"
+        )
+        return False
+    if not (
+        hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "fp8_mqa_logits")
+    ):
+        logger.warning(
+            "VLLM_ROCM_HIP_FP8_MQA_LOGITS=1 but _rocm_C was built without "
+            "fp8_mqa_logits; using the aiter fp8_mqa_logits path"
+        )
+        return False
+    logger.info("indexer prefill logits computed by the HIP fp8_mqa_logits kernel")
+    return True
+
+
 def rocm_fp8_mqa_logits(
     q: torch.Tensor,
     kv: tuple[torch.Tensor, torch.Tensor],
@@ -968,6 +992,21 @@ def rocm_fp8_mqa_logits(
     from vllm._aiter_ops import rocm_aiter_ops
 
     k_fp8, scale = kv
+
+    if _hip_fp8_mqa_logits_enabled() and q.dtype == torch.float8_e4m3fn:
+        from vllm import _custom_ops as ops
+
+        # The consumer (top_k_per_row_prefill) is range aware, so the -inf
+        # fill outside [ks, ke) is skipped like on the aiter Triton path.
+        return ops.fp8_mqa_logits(
+            q,
+            k_fp8,
+            scale.reshape(-1),
+            weights,
+            cu_seqlen_ks,
+            cu_seqlen_ke,
+            clean_logits=False,
+        )
 
     if _ON_GFX942 and rocm_aiter_ops.is_enabled():
         from aiter.ops.flydsl import flydsl_fp8_mqa_logits

@@ -81,6 +81,17 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("kpool_mixed_write", torch::kCUDA, &kpool_mixed_write);
 #endif  // VLLM_SKIP_KPOOL_COMPRESS
 
+#ifndef VLLM_SKIP_FP8_MQA_LOGITS
+  // GLM-5.x lightning-indexer prefill logits over a gathered fp8 K buffer
+  // (gfx950, n_heads=32, head_dim=128).
+  rocm_ops.def(
+      "fp8_mqa_logits(Tensor q_fp8, Tensor k_fp8, Tensor kv_scale, "
+      "Tensor weights, Tensor cu_seqlen_ks, Tensor cu_seqlen_ke, Tensor! out, "
+      "int split_n, int num_warps, int total_cu_count, bool clean_logits, "
+      "int reverse_rows) -> ()");
+  rocm_ops.impl("fp8_mqa_logits", torch::kCUDA, &fp8_mqa_logits);
+#endif  // VLLM_SKIP_FP8_MQA_LOGITS
+
 #ifdef VLLM_ROCM_GFX1100
   // MXFP4 weights x int8 activations GEMV for RDNA3/RDNA3.5 (gfx11) decode,
   // 1 <= M <= 8. Weights [N, K/2] uint8 E2M1, scales [N, K/32] uint8 E8M0.

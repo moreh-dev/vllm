@@ -105,3 +105,18 @@ void kpool_mixed_write(torch::Tensor& kv_cache, const torch::Tensor& ape,
                        std::optional<torch::Tensor> decode_slot_mapping,
                        std::optional<torch::Tensor> decode_positions);
 #endif  // VLLM_SKIP_KPOOL_COMPRESS
+
+// GLM-5.x / DeepSeek-V3.2 lightning-indexer prefill logits
+// (csrc/rocm/fp8_mqa_logits.cu, gfx950 only, n_heads=32, head_dim=128):
+//   out[m, n] = sum_h relu(q[m,h,:] . k[n,:]) * weights[m,h] * kv_scale[n]
+// for n in [cu_seqlen_ks[m], cu_seqlen_ke[m]); -inf elsewhere when
+// clean_logits, untouched otherwise. split_n / num_warps / total_cu_count /
+// reverse_rows <= 0 or -1 select the host heuristics.
+#ifndef VLLM_SKIP_FP8_MQA_LOGITS
+void fp8_mqa_logits(const torch::Tensor& q_fp8, const torch::Tensor& k_fp8,
+                    const torch::Tensor& kv_scale, const torch::Tensor& weights,
+                    const torch::Tensor& cu_seqlen_ks,
+                    const torch::Tensor& cu_seqlen_ke, torch::Tensor& out,
+                    int64_t split_n, int64_t num_warps, int64_t total_cu_count,
+                    bool clean_logits, int64_t reverse_rows);
+#endif  // VLLM_SKIP_FP8_MQA_LOGITS

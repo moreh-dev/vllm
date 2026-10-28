@@ -2298,6 +2298,54 @@ def kpool_mixed_write(
     )
 
 
+def fp8_mqa_logits(
+    q_fp8: torch.Tensor,  # [M, 32, 128] float8_e4m3fn
+    k_fp8: torch.Tensor,  # [N, 128] float8_e4m3fn
+    kv_scale: torch.Tensor,  # [N] fp32
+    weights: torch.Tensor,  # [M, 32] fp32
+    cu_seqlen_ks: torch.Tensor,  # [M] int32, row m is valid on [ks[m], ke[m])
+    cu_seqlen_ke: torch.Tensor,  # [M] int32
+    *,
+    clean_logits: bool = True,
+    split_n: int = 0,
+    num_warps: int = 0,
+    total_cu_count: int = 0,
+    reverse_rows: int = -1,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """GLM-5.x lightning-indexer prefill logits over a gathered fp8 K buffer
+    (csrc/rocm/fp8_mqa_logits.cu, gfx950, n_heads=32, head_dim=128):
+
+        out[m, n] = sum_h relu(q[m,h,:] . k[n,:]) * weights[m,h] * kv_scale[n]
+
+    Positions outside a row's window read -inf when ``clean_logits``, and are
+    left untouched otherwise (fine for range-aware consumers such as
+    top_k_per_row_prefill). Writes into ``out`` when given, else allocates
+    [M, N] fp32. ``split_n`` (workgroups along N per 32-row block),
+    ``num_warps`` (8 or 4), ``total_cu_count`` and ``reverse_rows`` <= 0 / -1
+    select the host heuristics (a makespan model fitted on MI355X).
+    """
+    if out is None:
+        out = torch.empty(
+            (q_fp8.shape[0], k_fp8.shape[0]), dtype=torch.float32, device=q_fp8.device
+        )
+    torch.ops._rocm_C.fp8_mqa_logits(
+        q_fp8,
+        k_fp8,
+        kv_scale,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        out,
+        split_n,
+        num_warps,
+        total_cu_count,
+        clean_logits,
+        reverse_rows,
+    )
+    return out
+
+
 # moe
 def moe_sum(
     input: torch.Tensor,
