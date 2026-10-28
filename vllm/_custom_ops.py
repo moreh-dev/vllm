@@ -2211,6 +2211,93 @@ def wvSplitKQ(
     return out
 
 
+# GLM-5.3-Flash sparse-indexer kpool cache writers (csrc/rocm/kpool_compress.cu,
+# gfx942 / gfx950). All three write kv_cache (and the tail ring) in place and
+# are byte-identical to the Triton writers in
+# vllm/models/glm5next/amd/ops/kpool_compress.py. kv_cache is
+# [num_blocks, page_size, 132] uint8: 128 fp8 e4m3fn key bytes per token (the
+# MFMA 16x16 preshuffled layout when page_size > 1) followed by page_size fp32
+# scales; ape is the [pool_size, 128] fp32 additive position embedding.
+def kpool_compress_insert(
+    kv_cache: torch.Tensor,
+    k: torch.Tensor,  # [n_tokens, 128] bf16, rows may be strided
+    gate_score: torch.Tensor,  # [n_tokens, 128] bf16
+    ape: torch.Tensor,
+    slot_mapping: torch.Tensor,  # [n_tokens] int32 / int64, >= 0 on closing tokens
+    pool_size: int,
+    round_scale: bool = True,
+    lanes_per_pool: int = 0,  # 0: auto, else 16 / 32 / 64
+) -> None:
+    torch.ops._rocm_C.kpool_compress_insert(
+        kv_cache, k, gate_score, ape, slot_mapping, pool_size, round_scale, lanes_per_pool
+    )
+
+
+def kpool_decode_update(
+    kv_cache: torch.Tensor,
+    tail_kv_cache: torch.Tensor,  # [num_blocks, 2, ring, 128] bf16
+    tail_slot_mapping: torch.Tensor,  # [num_requests, next_n] int32 / int64
+    key: torch.Tensor,  # [num_requests, next_n, 128] bf16
+    slot_score: torch.Tensor,  # [num_requests, next_n, 128] bf16
+    ape: torch.Tensor,
+    slot_mapping: torch.Tensor,  # [num_requests, next_n], dtype of tail_slot_mapping
+    positions: torch.Tensor,  # [num_requests, next_n], dtype of tail_slot_mapping
+    pool_size: int,
+    round_scale: bool = True,
+) -> None:
+    torch.ops._rocm_C.kpool_decode_update(
+        kv_cache,
+        tail_kv_cache,
+        tail_slot_mapping,
+        key,
+        slot_score,
+        ape,
+        slot_mapping,
+        positions,
+        pool_size,
+        round_scale,
+    )
+
+
+def kpool_mixed_write(
+    kv_cache: torch.Tensor,
+    ape: torch.Tensor,
+    pool_size: int,
+    round_scale: bool = True,
+    lanes_per_pool: int = 0,
+    prefill_k: torch.Tensor | None = None,
+    prefill_gate: torch.Tensor | None = None,
+    prefill_slot_mapping: torch.Tensor | None = None,
+    # [n_tokens], dtype of prefill_slot_mapping: also seed the tail ring
+    prefill_tail_slot_mapping: torch.Tensor | None = None,
+    tail_kv_cache: torch.Tensor | None = None,
+    # decode metadata: the dtype of prefill_slot_mapping when both sides run
+    decode_tail_slot_mapping: torch.Tensor | None = None,
+    decode_key: torch.Tensor | None = None,
+    decode_gate: torch.Tensor | None = None,
+    decode_slot_mapping: torch.Tensor | None = None,
+    decode_positions: torch.Tensor | None = None,
+) -> None:
+    """Prefill insert + tail seeding + decode update in one launch."""
+    torch.ops._rocm_C.kpool_mixed_write(
+        kv_cache,
+        ape,
+        pool_size,
+        round_scale,
+        lanes_per_pool,
+        prefill_k,
+        prefill_gate,
+        prefill_slot_mapping,
+        prefill_tail_slot_mapping,
+        tail_kv_cache,
+        decode_tail_slot_mapping,
+        decode_key,
+        decode_gate,
+        decode_slot_mapping,
+        decode_positions,
+    )
+
+
 # moe
 def moe_sum(
     input: torch.Tensor,

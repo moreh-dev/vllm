@@ -1645,6 +1645,37 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     list(APPEND VLLM_ROCM_EXT_FLAGS "-DVLLM_SKIP_SKINNY_GEMMS")
   endif()
 
+  # kpool_compress.cu (GLM-5.3-Flash sparse-indexer kpool cache writers) is
+  # written for CDNA3 / CDNA4 (fp8 e4m3fn conversions, permlane swaps on
+  # gfx950, LDS fallback on gfx942) and only validated there: build it for
+  # gfx942 / gfx950 in its own object library and skip its op registrations
+  # (VLLM_SKIP_KPOOL_COMPRESS) when neither is in the arch list; vLLM then
+  # uses the Triton kpool writers. --amdgpu-kernarg-preload-count: the decode
+  # kernel's first loads take their arguments from preloaded user SGPRs
+  # (hipcc >= 7.2 on gfx950, ignored elsewhere).
+  set(VLLM_KPOOL_ARCHES ${VLLM_GPU_ARCHES})
+  list(FILTER VLLM_KPOOL_ARCHES INCLUDE REGEX "gfx942|gfx950")
+  if(VLLM_KPOOL_ARCHES)
+    message(STATUS "Building kpool_compress for archs: ${VLLM_KPOOL_ARCHES}")
+    set(VLLM_KPOOL_SRC "csrc/rocm/kpool_compress.cu")
+    hipify_sources_target(VLLM_KPOOL_HIP_SRCS _rocm_C_kpool "${VLLM_KPOOL_SRC}")
+    unset(_VLLM_LAST_HIPIFY_TARGET)
+    add_library(_rocm_C_kpool OBJECT ${VLLM_KPOOL_HIP_SRCS})
+    add_dependencies(_rocm_C_kpool hipify_all)
+    set_source_files_properties(${VLLM_KPOOL_HIP_SRCS} PROPERTIES LANGUAGE ${VLLM_GPU_LANG})
+    set_target_properties(_rocm_C_kpool PROPERTIES
+      ${VLLM_GPU_LANG}_ARCHITECTURES "${VLLM_KPOOL_ARCHES}"
+      POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(_rocm_C_kpool PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/csrc)
+    target_compile_options(_rocm_C_kpool PRIVATE
+      $<$<COMPILE_LANGUAGE:${VLLM_GPU_LANG}>:${VLLM_ROCM_EXT_FLAGS};-mllvm;--amdgpu-kernarg-preload-count=32>)
+    target_compile_definitions(_rocm_C_kpool PRIVATE "-DTORCH_EXTENSION_NAME=_rocm_C")
+    target_link_libraries(_rocm_C_kpool PRIVATE torch)
+  else()
+    message(STATUS "No gfx942 / gfx950 in the arch list, skipping kpool_compress")
+    list(APPEND VLLM_ROCM_EXT_FLAGS "-DVLLM_SKIP_KPOOL_COMPRESS")
+  endif()
+
   set(VLLM_ROCM_HAS_GFX1100 OFF)
   if(VLLM_GPU_ARCHES MATCHES "gfx1100")
     set(VLLM_ROCM_HAS_GFX1100 ON)
@@ -1669,6 +1700,12 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     target_link_libraries(_rocm_C PRIVATE _rocm_C_skinny)
   else()
     target_compile_definitions(_rocm_C PRIVATE VLLM_SKIP_SKINNY_GEMMS)
+  endif()
+
+  if(TARGET _rocm_C_kpool)
+    target_link_libraries(_rocm_C PRIVATE _rocm_C_kpool)
+  else()
+    target_compile_definitions(_rocm_C PRIVATE VLLM_SKIP_KPOOL_COMPRESS)
   endif()
 
   if(VLLM_ROCM_HAS_GFX1100)

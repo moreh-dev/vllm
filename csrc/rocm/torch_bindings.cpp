@@ -53,6 +53,34 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("wvSplitKQ", torch::kCUDA, &wvSplitKQ);
 #endif  // VLLM_SKIP_SKINNY_GEMMS
 
+#ifndef VLLM_SKIP_KPOOL_COMPRESS
+  // GLM-5.3-Flash sparse-indexer kpool cache writers (gfx942 / gfx950):
+  // byte-identical to the Triton writers in
+  // vllm/models/glm5next/amd/ops/kpool_compress.py.
+  rocm_ops.def(
+      "kpool_compress_insert(Tensor! kv_cache, Tensor k, Tensor gate_score, "
+      "Tensor ape, Tensor slot_mapping, int pool_size, bool round_scale, "
+      "int lanes_per_pool) -> ()");
+  rocm_ops.impl("kpool_compress_insert", torch::kCUDA, &kpool_compress_insert);
+
+  rocm_ops.def(
+      "kpool_decode_update(Tensor! kv_cache, Tensor! tail_kv_cache, "
+      "Tensor tail_slot_mapping, Tensor key, Tensor slot_score, Tensor ape, "
+      "Tensor slot_mapping, Tensor positions, int pool_size, "
+      "bool round_scale) -> ()");
+  rocm_ops.impl("kpool_decode_update", torch::kCUDA, &kpool_decode_update);
+
+  rocm_ops.def(
+      "kpool_mixed_write(Tensor! kv_cache, Tensor ape, int pool_size, "
+      "bool round_scale, int lanes_per_pool, Tensor? prefill_k, "
+      "Tensor? prefill_gate, Tensor? prefill_slot_mapping, "
+      "Tensor? prefill_tail_slot_mapping, Tensor!? tail_kv_cache, "
+      "Tensor? decode_tail_slot_mapping, Tensor? decode_key, "
+      "Tensor? decode_gate, Tensor? decode_slot_mapping, "
+      "Tensor? decode_positions) -> ()");
+  rocm_ops.impl("kpool_mixed_write", torch::kCUDA, &kpool_mixed_write);
+#endif  // VLLM_SKIP_KPOOL_COMPRESS
+
 #ifdef VLLM_ROCM_GFX1100
   // MXFP4 weights x int8 activations GEMV for RDNA3/RDNA3.5 (gfx11) decode,
   // 1 <= M <= 8. Weights [N, K/2] uint8 E2M1, scales [N, K/32] uint8 E8M0.

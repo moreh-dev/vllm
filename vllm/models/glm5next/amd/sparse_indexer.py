@@ -46,31 +46,33 @@ _GFX950_KPOOL_AITER_MIN_POOLS = 16 * 1024
 
 
 @functools.cache
-def _aiter_kpool_writers():
-    """aiter's HIP kpool cache writers ``(kpool_mixed_write, kpool_decode_update)``
-    when VLLM_ROCM_KPOOL_AITER_COMPRESS=1 on gfx950, else None (the Triton
-    writers below). Byte-identical output; the HIP kernels read the int64 slot
-    mappings and positions directly."""
-    if not envs.VLLM_ROCM_KPOOL_AITER_COMPRESS:
+def _hip_kpool_writers():
+    """The HIP kpool cache writers ``(kpool_mixed_write, kpool_decode_update)``
+    of _rocm_C (csrc/rocm/kpool_compress.cu) when
+    VLLM_ROCM_KPOOL_HIP_COMPRESS=1 on gfx942 / gfx950, else None (the Triton
+    writers below). Byte-identical output; the HIP kernels read the int64
+    slot mappings and positions directly."""
+    if not envs.VLLM_ROCM_KPOOL_HIP_COMPRESS:
         return None
-    from vllm.platforms.rocm import on_gfx950
+    from vllm.platforms.rocm import on_gfx942, on_gfx950
 
-    if not (rocm_aiter_ops.is_enabled() and on_gfx950()):
+    if not (on_gfx942() or on_gfx950()):
         logger.warning(
-            "VLLM_ROCM_KPOOL_AITER_COMPRESS=1 needs VLLM_ROCM_USE_AITER=1 on "
-            "gfx950; using the Triton kpool writers"
+            "VLLM_ROCM_KPOOL_HIP_COMPRESS=1 needs gfx942 / gfx950; using the "
+            "Triton kpool writers"
         )
         return None
-    try:
-        from aiter.ops.kpool_compress import kpool_decode_update, kpool_mixed_write
-    except ImportError:
+    if not (
+        hasattr(torch.ops, "_rocm_C")
+        and hasattr(torch.ops._rocm_C, "kpool_mixed_write")
+    ):
         logger.warning(
-            "VLLM_ROCM_KPOOL_AITER_COMPRESS=1 but this aiter has no "
-            "kpool_compress ops; using the Triton kpool writers"
+            "VLLM_ROCM_KPOOL_HIP_COMPRESS=1 but _rocm_C was built without "
+            "kpool_compress; using the Triton kpool writers"
         )
         return None
-    logger.info("kpool index cache written by aiter HIP kernels")
-    return kpool_mixed_write, kpool_decode_update
+    logger.info("kpool index cache written by the HIP kpool_compress kernels")
+    return _custom_ops.kpool_mixed_write, _custom_ops.kpool_decode_update
 
 # kpool write helper: form pools from the current token batch and compress them
 # into the index K cache via the fused Triton kernel.
@@ -286,11 +288,11 @@ def sparse_attn_indexer_kpool(
                     if tail_meta is not None:
                         assert isinstance(tail_meta, DeepseekV32IndexerMetadata)
                         prefill_tail_slots = tail_meta.slot_mapping[prefill_slice]
-                aiter_kpool = _aiter_kpool_writers()
-                if aiter_kpool is not None:
-                    # aiter HIP writer: the pool insert and the tail seeding in
+                hip_kpool = _hip_kpool_writers()
+                if hip_kpool is not None:
+                    # HIP writer: the pool insert and the tail seeding in
                     # one launch, K / gate rows read in place (no gathers).
-                    aiter_kpool[0](
+                    hip_kpool[0](
                         kv_cache,
                         compress_ape,
                         index_kpool,
@@ -537,11 +539,11 @@ def sparse_attn_indexer_kpool(
                 use_uniform = not decode_metadata.requires_padding
                 group_lens = decode_metadata.decode_lens
                 lmax = int(decode_metadata.decode_lens.max().item())
-            aiter_kpool = _aiter_kpool_writers()
-            # The Triton kernel reads int32 positions; the aiter kernel reads
+            hip_kpool = _hip_kpool_writers()
+            # The Triton kernel reads int32 positions; the HIP kernel reads
             # all three metadata tensors in the slot mapping's dtype (int64),
             # so nothing is converted on that path.
-            pos_dtype = slot_mapping.dtype if aiter_kpool is not None else torch.int32
+            pos_dtype = slot_mapping.dtype if hip_kpool is not None else torch.int32
             if not use_uniform:
                 # Non-uniform decode_lens (mixed plain-decode + spec-verify, or
                 # a variable MTP-verify batch): scatter actual tokens into a
@@ -607,10 +609,10 @@ def sparse_attn_indexer_kpool(
                 dec_tail_slot = tail_meta.slot_mapping[:num_decode_tokens].view(shape2)
             # The compress kernel writes the raw fp8 cache (not the quant view);
             # pass the underlying kv_cache, not kv_cache_quant_view.
-            if dec_tail_slot is not None and aiter_kpool is not None:
-                # aiter HIP writer: one wave per request, same token order as
+            if dec_tail_slot is not None and hip_kpool is not None:
+                # HIP writer: one wave per request, same token order as
                 # the Triton walk (byte-identical cache and tail ring).
-                aiter_kpool[1](
+                hip_kpool[1](
                     kv_cache_raw,
                     tail_kv_cache,
                     dec_tail_slot,
