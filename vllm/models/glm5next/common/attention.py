@@ -24,6 +24,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.mla import MLAModules, MultiHeadLatentAttentionWrapper
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding, get_rope
+from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
 from vllm.model_executor.models.deepseek_v2 import (
     DeepSeekV2FusedQkvAProjLinear,
     DeepseekV32IndexerCache,
@@ -213,7 +214,8 @@ class Indexer(nn.Module):
             torch.zeros(self.index_kpool, self.head_dim, dtype=torch.float32)
         )
         # Keep the checkpoint name ``index_kpool_compress_gate`` without a
-        # ``.weight`` suffix. F.linear consumes its [head_dim, hidden_size] shape.
+        # ``.weight`` suffix. Its [head_dim, hidden_size] shape is stacked under
+        # wk_weights_proj's weight for the merged GEMM in forward.
         self.index_kpool_compress_gate = nn.Parameter(
             torch.empty(self.head_dim, hidden_size, dtype=torch.bfloat16)
         )
@@ -245,7 +247,12 @@ class Indexer(nn.Module):
         self.scale_fmt = "ue8m0"
         self.quant_block_size = 128  # TODO: get from config
         self.topk_indices_buffer = topk_indices_buffer
-        self._wp_fp32: torch.Tensor | None = None
+        # [wk; weights_proj; kpool compress gate], stacked after loading so that
+        # one GEMM yields k, the bf16 head gate (unused) and the gate score.
+        self._w_kwg: torch.Tensor | None = None
+        self._kwg_gemm = dispatch_unquantized_gemm(
+            vllm_config.kernel_config.linear_backend
+        )
 
         # NOTE: (zyongye) we use fp8 naive cache,
         #       where we store value in fp8 and scale in fp32
@@ -288,15 +295,12 @@ class Indexer(nn.Module):
         )
 
     def process_weights_after_loading(self) -> None:
-        """Build the fp32 head-gate projection from the loaded weights; reloads
-        refill it in place."""
-        wp = (
-            self.wk_weights_proj.weight.data[self.head_dim :, :]
-            .t()
-            .contiguous()
-            .float()
+        """Stack the merged-GEMM weight from the loaded weights; reloads refill it
+        in place."""
+        w_kwg = torch.cat(
+            [self.wk_weights_proj.weight.data, self.index_kpool_compress_gate.data]
         )
-        refill_derived(self, "_wp_fp32", wp)
+        refill_derived(self, "_w_kwg", w_kwg)
 
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
@@ -304,11 +308,26 @@ class Indexer(nn.Module):
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
 
-        # Compute the head gate in fp32; bf16 error can change near-tie pool
-        # rankings on long-context tasks. Built after weights are loaded.
-        kw, _ = self.wk_weights_proj(hidden_states)
-        k = kw[:, : self.head_dim]
-        weights = torch.mm(hidden_states.float(), self._wp_fp32)
+        # wk, weights_proj and the kpool compress gate all multiply hidden_states:
+        # one GEMM on the stacked weight replaces the wk_weights_proj GEMM and an
+        # F.linear (+ split-K reduce) for the gate. Columns: [k | bf16 head gate
+        # (unused) | gate score]. gate_score stays a strided view: the kpool
+        # kernels take its row stride (the prefill tail seed gets a copy).
+        w_kwg = self._w_kwg
+        assert w_kwg is not None, "built in process_weights_after_loading"
+        kwg = self._kwg_gemm(self.wk_weights_proj, hidden_states, w_kwg, None)
+        k = kwg[:, : self.head_dim]
+        gate_score = kwg[:, self.head_dim + self.n_head :]
+        # Head gate in fp32 (bf16 error can change near-tie pool rankings on
+        # long-context tasks) as a bf16-in / fp32-out GEMM on the bf16 weight rows:
+        # bf16 x bf16 products are exact in fp32, so no fp32 copy of hidden_states
+        # or of the weight is needed. The transposed view (not a contiguous copy)
+        # keeps hipBLASLt off split-K at small M.
+        weights = torch.mm(
+            hidden_states,
+            w_kwg[self.head_dim : self.head_dim + self.n_head].t(),
+            out_dtype=torch.float32,
+        )
 
         k = _fused_indexer_k_norm(
             k, self.k_norm.weight, self.k_norm.bias, self.head_dim, self.k_norm.eps
@@ -351,11 +370,6 @@ class Indexer(nn.Module):
             q, weights.contiguous(), self.softmax_scale * self.n_head**-0.5
         )
         q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
-
-        # kpool: per-token gate score driving the softmax-weighted pool. Computed
-        # from the same hidden_states that produced `k`, so it stays token-aligned.
-        # F.linear(x, gate) = x @ gate.T  with gate [head_dim, hidden_size].
-        gate_score = F.linear(hidden_states, self.index_kpool_compress_gate)
 
         # DeepGEMM's MQA-logits kernels (fp8_mqa_logits /
         # fp8_fp4_paged_mqa_logits) require num_heads in {32, 64}; this

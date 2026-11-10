@@ -144,6 +144,8 @@ class Glm5NextModelConfig(VerifyAndUpdateConfig):
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
         from vllm.platforms import current_platform
 
+        Glm5NextModelConfig._set_rocm_kpool_topk_backend(vllm_config)
+
         cache_config = vllm_config.cache_config
         if (
             cache_config.cache_dtype != "auto"
@@ -163,6 +165,37 @@ class Glm5NextModelConfig(VerifyAndUpdateConfig):
             and spec_config.kv_cache_dtype is None
         ):
             spec_config.kv_cache_dtype = "auto"
+
+    @staticmethod
+    def _set_rocm_kpool_topk_backend(vllm_config: "VllmConfig") -> None:
+        """Default the kpool indexer's decode top-k to per_row on MI355 (gfx950).
+
+        With "auto", the FULL decode graphs run AITER's top-k (7 kernels per
+        layer): the V2 runner captures them in CUDAGraphMode.NONE and with
+        max_model_len as the sequence length, which falls in the AITER window of
+        `_kpool_decode_topk_backend`. per_row (2 kernels) selects the same pools;
+        on MI355X it is faster up to ~27k pools (~107k tokens) and slower past
+        ~65k pools (~260k tokens). An explicitly configured backend is kept.
+        """
+        from vllm.platforms import current_platform
+
+        kernel_config = vllm_config.kernel_config
+        hf_config = vllm_config.model_config.hf_text_config
+        if (
+            not current_platform.is_rocm()
+            or kernel_config.sparse_indexer_topk_backend != "auto"
+            or (getattr(hf_config, "index_kpool", None) or 1) <= 1
+        ):
+            return
+        from vllm.platforms.rocm import on_gfx950
+
+        if not on_gfx950():
+            return
+        kernel_config.sparse_indexer_topk_backend = "per_row"
+        logger.info_once(
+            "Using the per_row sparse indexer top-k for GLM-5.3-Flash on gfx950 "
+            "(set sparse_indexer_topk_backend in --kernel-config to override)"
+        )
 
 
 class Ernie4_5_VLMoeForConditionalGenerationConfig(VerifyAndUpdateConfig):

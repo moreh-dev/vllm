@@ -272,7 +272,9 @@ def sparse_attn_indexer_kpool(
                         kpool_ops.kpool_seed_tail_cache(
                             tail_kv_cache,
                             k[prefill_slice],
-                            gate_score[prefill_slice],
+                            # The seed kernel assumes dense rows; gate_score
+                            # may be a strided view of a merged GEMM output.
+                            gate_score[prefill_slice].contiguous(),
                             tail_meta.slot_mapping[prefill_slice],
                             index_kpool,
                             head_dim,
