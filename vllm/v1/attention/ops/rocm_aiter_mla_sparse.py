@@ -69,7 +69,7 @@ def use_cp_indexer(
 ) -> bool:
     """Whether to split the indexer prefill rows of a batch across TP ranks.
 
-    The metadata builder asks before the batch is chunked (``chunks=None``) to
+    The metadata builder asks before the batch is chunked (`chunks=None`) to
     widen its logits budget; the op asks again with the chunks. Candidate-block
     batches stay replicated, since the auxiliary state they build is not
     covered by the Top-K-only collective, and so do batches whose chunks all
@@ -110,7 +110,7 @@ def _m_split_stripes(
         tp_world_size: Ranks in the tensor-parallel group.
 
     Returns:
-        ``(offset, rows)`` pairs, offsets relative to the start of the chunk.
+        `(offset, rows)` pairs, offsets relative to the start of the chunk.
 
     """
     if chunk_m <= 2 * tp_world_size:

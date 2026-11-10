@@ -1402,7 +1402,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         - N constraint: total_seq_lens <= workspace_size (existing O(N)
           workspace)
         - Logits constraint: M * N * 4 <= max_logits_bytes. The CP indexer
-          stripes prefill rows across ``m_split_tp_size`` TP ranks and each
+          stripes prefill rows across `m_split_tp_size` TP ranks and each
           rank materialises only its own stripe, so the bound applies per rank
           and M may be that many times larger.
 
