@@ -293,7 +293,20 @@ def sparse_attn_indexer_kpool(
                 scale_fmt,
             )
 
-    topk_indices_buffer[: hidden_states.shape[0]] = -1
+    # Uniform decode-only batch (the FULL decode CUDA graph): the expand kernel at
+    # the end of the decode branch writes every column of rows [:n] in place (-1
+    # past the kpool tail), so this -1 pre-fill and the final copy are redundant.
+    decode_writes_all_rows = (
+        has_decode
+        and not has_prefill
+        and index_kpool > 1
+        and positions is not None
+        and attn_metadata_narrowed.decode is not None
+        and not attn_metadata_narrowed.decode.requires_padding
+        and num_decode_tokens == hidden_states.shape[0]
+    )
+    if not decode_writes_all_rows:
+        topk_indices_buffer[: hidden_states.shape[0]] = -1
     if has_prefill:
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
@@ -518,7 +531,7 @@ def sparse_attn_indexer_kpool(
                     scatter_idx,
                 )
                 dec_pos = _scatter_decode_tokens_by_request(
-                    positions[:num_decode_tokens].to(torch.int32),
+                    positions[:num_decode_tokens],
                     -1,
                     num_requests,
                     lmax,
@@ -530,7 +543,9 @@ def sparse_attn_indexer_kpool(
                 dec_k = k[:num_decode_tokens].view(*shape2, head_dim)
                 dec_gate = gate_score[:num_decode_tokens].view(*shape2, head_dim)
                 dec_slot = slot_mapping[:num_decode_tokens].view(shape2)
-                dec_pos = positions[:num_decode_tokens].to(torch.int32).view(shape2)
+                # positions stay int64: the kpool kernel only takes max / % / >= 0
+                # of them (an int32 copy only costs a kernel).
+                dec_pos = positions[:num_decode_tokens].view(shape2)
             tail_meta = (
                 attn_metadata.get(_resolve_layer_name(tail_prefix))
                 if tail_prefix is not None
@@ -681,7 +696,9 @@ def sparse_attn_indexer_kpool(
 
         # Resolve to token-level indices in the output buffer.
         if index_kpool > 1:
-            pool_ids = pool_topk.to(torch.int64)
+            # int32 as produced by top-k: the expand kernel takes any int dtype
+            # and emits int32 anyway (an int64 copy only costs a kernel).
+            pool_ids = pool_topk
             n = pool_topk.shape[0]
             # Decode seq_lens are pool-granular; recover token lengths from
             # positions using the padded [B, next_n] row layout when needed.
@@ -693,13 +710,22 @@ def sparse_attn_indexer_kpool(
                     batch_size,
                     next_n,
                     decode_metadata.requires_padding,
+                    add_one=False,  # +1 is done in the expand kernel
                 )
+                seq_off = 1
             else:
+                seq_off = 0
                 dec_seq = decode_metadata.seq_lens[:n]
                 if dec_seq.ndim == 2:
                     dec_seq = dec_seq[:, -1]
                 dec_seq = dec_seq.to(torch.int32)
-            out = kpool_ops.expand_pools_and_append_tail(pool_ids, dec_seq, index_kpool)
+            out = kpool_ops.expand_pools_and_append_tail(
+                pool_ids,
+                dec_seq,
+                index_kpool,
+                seq_len_offset=seq_off,
+                out=topk_indices_buffer[:n] if decode_writes_all_rows else None,
+            )
         else:
             out = topk_dst
 
@@ -708,7 +734,8 @@ def sparse_attn_indexer_kpool(
             out = unpack_seq_triton(
                 out.reshape(batch_size, -1, out.shape[-1]), decode_lens
             )
-        topk_indices_buffer[: out.shape[0], : out.shape[-1]] = out
+        if not (index_kpool > 1 and decode_writes_all_rows):
+            topk_indices_buffer[: out.shape[0], : out.shape[-1]] = out
 
     return topk_indices_buffer
 

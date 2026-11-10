@@ -30,7 +30,9 @@ from vllm.model_executor.models.deepseek_v2 import (
     yarn_get_mscale,
 )
 from vllm.model_executor.utils import maybe_disable_graph_partition, refill_derived
-from vllm.models.glm5next.nvidia.ops.kpool_compress import fwht128_quant_fp8
+from vllm.models.glm5next.nvidia.ops.kpool_compress import (
+    fwht128_quant_fp8_wscale,
+)
 from vllm.models.glm5next.sparse_indexer import SparseAttnIndexerKpool
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv, next_power_of_2
@@ -57,15 +59,6 @@ def _fused_indexer_k_norm(
 ) -> torch.Tensor:
     # Fuse fp32 cast + layer_norm + cast-back (was 3 kernels) into one.
     return F.layer_norm(x.float(), (dim,), weight, bias, eps).type_as(x)
-
-
-@torch.compile(**_INDEXER_COMPILE)
-def _fused_indexer_weight_scale(
-    weights: torch.Tensor, q_scale: torch.Tensor, scale: float
-) -> torch.Tensor:
-    # Fuse the weight-scaling muls (was 2 kernels) into one. `scale` folds
-    # softmax_scale (head_dim**-0.5) and n_head**-0.5 into a single constant.
-    return (weights.unsqueeze(-1) * q_scale * scale).squeeze(-1)
 
 
 @torch.compile(**_INDEXER_COMPILE)
@@ -351,13 +344,13 @@ class Indexer(nn.Module):
         assert self.head_dim == 128 and self.quant_block_size == 128
         assert self.scale_fmt == "ue8m0"
         q = q.view(-1, self.head_dim)
-        q_fp8, q_scale = fwht128_quant_fp8(q)
-        q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
-        q_scale = q_scale.view(-1, self.n_head, 1)
-
-        weights = _fused_indexer_weight_scale(
-            weights, q_scale, self.softmax_scale * self.n_head**-0.5
+        # Scale the head gate by q_scale * softmax_scale * n_head**-0.5 inside the
+        # FWHT + quant kernel, which holds q_scale in registers (saves a kernel).
+        # Same multiply order as the former separate kernel, so bit-exact.
+        q_fp8, _, weights = fwht128_quant_fp8_wscale(
+            q, weights.contiguous(), self.softmax_scale * self.n_head**-0.5
         )
+        q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
 
         # kpool: per-token gate score driving the softmax-weighted pool. Computed
         # from the same hidden_states that produced `k`, so it stays token-aligned.

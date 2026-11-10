@@ -532,7 +532,7 @@ def _kpool_decode_update_batched_kernel(
     ape_ptr,
     ape_stride_0,
     slot_mapping_ptr,  # [B, NEXT_N] int32
-    positions_ptr,  # [B, NEXT_N] int32
+    positions_ptr,  # [B, NEXT_N] int32 or int64
     NEXT_N,  # runtime token count per request (no .item() needed)
     PAGE_SIZE: tl.constexpr,
     BUF_NUMEL_PER_PAGE: tl.constexpr,
@@ -721,7 +721,7 @@ def kpool_decode_update_and_maybe_write_cache_batched(
         slot_score: `[num_requests, next_n, head_dim]` bf16.
         ape: `[pool_size, head_dim]` fp32.
         slot_mapping: `[num_requests, next_n]` int32.
-        positions: `[num_requests, next_n]` int32.
+        positions: `[num_requests, next_n]` int32 or int64.
         pool_size: Number of tokens compressed into one cache entry.
         head_dim: Indexer head dimension.
         round_scale: Round each fp8 scale down to a power of two.
@@ -911,7 +911,7 @@ def append_tail_to_topk(
 @triton.jit
 def _expand_pools_and_append_tail_kernel(
     pool_ids_ptr,  # [rows, n_groups], int (any int dtype)
-    seq_lens_ptr,  # [rows], int32 (token-granular seq_len)
+    seq_lens_ptr,  # [rows], int (any int dtype; token-granular seq_len)
     out_ptr,  # [rows, out_cols], int32
     topk,  # n_groups * pool_size
     out_cols,  # topk + pool_size - 1
@@ -919,6 +919,7 @@ def _expand_pools_and_append_tail_kernel(
     BLOCK_COLS: tl.constexpr,
     pid_s0,
     out_s0,
+    SEQ_OFF: tl.constexpr = 0,
 ):
     # Fuses expand_pools_to_tokens + append_tail_to_topk (identity path) into a
     # single kernel. Each program writes one (row, column-tile) of the output.
@@ -927,7 +928,7 @@ def _expand_pools_and_append_tail_kernel(
     cols = tile * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
     mask = cols < out_cols
 
-    seq_len = tl.load(seq_lens_ptr + row)
+    seq_len = tl.load(seq_lens_ptr + row) + SEQ_OFF
     pool_len = seq_len // POOL_SIZE
     tail_start = pool_len * POOL_SIZE
     tail_count = seq_len - tail_start  # in [0, POOL_SIZE)
@@ -954,6 +955,8 @@ def expand_pools_and_append_tail(
     pool_ids: torch.Tensor,
     seq_lens: torch.Tensor,
     pool_size: int,
+    seq_len_offset: int = 0,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fuse `expand_pools_to_tokens` + `append_tail_to_topk` (identity path).
 
@@ -967,7 +970,14 @@ def expand_pools_and_append_tail(
     rows, n_groups = pool_ids.shape
     topk = n_groups * pool_size
     out_cols = topk + pool_size - 1
-    out = torch.empty((rows, out_cols), dtype=torch.int32, device=pool_ids.device)
+    if out is None:
+        out = torch.empty((rows, out_cols), dtype=torch.int32, device=pool_ids.device)
+    else:
+        # Write straight into the caller's buffer (rows [:rows] of the top-k index
+        # buffer) over its full width: columns past the kpool tail come out -1.
+        assert out.dtype == torch.int32 and out.stride(1) == 1
+        assert out.shape[0] == rows and out.shape[1] >= out_cols
+        out_cols = out.shape[1]
     BLOCK_COLS = 128
     n_tiles = triton.cdiv(out_cols, BLOCK_COLS)
     _expand_pools_and_append_tail_kernel[(rows, n_tiles)](
@@ -980,5 +990,6 @@ def expand_pools_and_append_tail(
         BLOCK_COLS=BLOCK_COLS,
         pid_s0=pool_ids.stride(0),
         out_s0=out.stride(0),
+        SEQ_OFF=seq_len_offset,  # seq_len = seq_lens[row] + seq_len_offset
     )
     return out
