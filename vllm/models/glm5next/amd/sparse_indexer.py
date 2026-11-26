@@ -142,7 +142,14 @@ def _kpool_prefill_write(
     if tail_slot_mapping is not None:
         assert tail_kv_cache is not None
         kpool_ops.kpool_seed_tail_cache(
-            tail_kv_cache, k, gate_score, tail_slot_mapping, kpool, head_dim
+            tail_kv_cache,
+            k,
+            # The seed kernel assumes dense rows; gate_score may be a strided
+            # view of a merged GEMM output.
+            gate_score.contiguous(),
+            tail_slot_mapping,
+            kpool,
+            head_dim,
         )
 
 
