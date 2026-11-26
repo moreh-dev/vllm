@@ -95,6 +95,7 @@ def _decode_topk_seq_lens(
     batch_size: int,
     next_n: int,
     requires_padding: bool,
+    add_one: bool = True,
 ) -> torch.Tensor:
     """Token-granular seq_len (pos + 1) per pool-topk row, layout-aware.
 
@@ -108,21 +109,31 @@ def _decode_topk_seq_lens(
     another request's length, dropping the row's real tail tokens or emitting
     indices past its sequence (out-of-bounds block-table reads). Padded rows
     get 0 (empty tail); they are dropped by `unpack_seq_triton` anyway.
+
+    With `add_one=False` the result is the row's position (`seq_len - 1`) in
+    the dtype of `positions`, for a caller whose kernel adds the 1 itself and
+    takes any int dtype; this saves the int32 cast and the +1 kernels.
     """
     n = batch_size * next_n
     if not requires_padding:
+        if not add_one:
+            return positions[:n]
         return positions[:n].to(torch.int32) + 1
     scatter_idx = _build_decode_scatter_indices(
         decode_lens, batch_size, num_decode_tokens
     )
+    dec_pos = positions[:num_decode_tokens]
+    if add_one:
+        dec_pos = dec_pos.to(torch.int32)
     padded = _scatter_decode_tokens_by_request(
-        positions[:num_decode_tokens].to(torch.int32),
+        dec_pos,
         -1,
         batch_size,
         next_n,
         scatter_idx,
-    )
-    return padded.reshape(n) + 1  # pad rows: -1 + 1 = 0 -> empty tail
+    ).reshape(n)
+    # Pad rows: -1 + 1 = 0 -> empty tail (the caller adds the 1 if not add_one).
+    return padded + 1 if add_one else padded
 
 
 def _fill_causal_indices(rows: torch.Tensor, positions: torch.Tensor) -> None:

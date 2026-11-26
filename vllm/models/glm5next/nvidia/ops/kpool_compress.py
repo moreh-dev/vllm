@@ -65,13 +65,21 @@ def _fwht_quant_kernel(
     q_ptr,
     qout_ptr,
     sout_ptr,
+    w_ptr,
+    wout_ptr,
     n_rows,
+    wscale,
     BLOCK_R: tl.constexpr,
+    HAS_W: tl.constexpr,
 ):
     """Fused Hadamard-128 rotation + per-row absmax FP8 (ue8m0) quant.
 
     Each row uses fp32 butterflies and scaling, rounds to bf16, then applies
     absmax quantization with a power-of-two scale.
+
+    With `HAS_W`, also scales the indexer head gate while the row's scale is
+    still in registers: `wout[r] = (w[r] * scale[r]) * wscale`. Row `r` is
+    `token * n_head + head`, the flat index of `w`.
     """
     pid = tl.program_id(0)
     rows = pid * BLOCK_R + tl.arange(0, BLOCK_R)
@@ -105,6 +113,45 @@ def _fwht_quant_kernel(
 
     tl.store(qout_ptr + rows[:, None] * 128 + offs[None, :], y, mask=rmask[:, None])
     tl.store(sout_ptr + rows, scale, mask=rmask)
+    if HAS_W:
+        w = tl.load(w_ptr + rows, mask=rmask, other=0.0)
+        tl.store(wout_ptr + rows, (w * scale) * wscale, mask=rmask)
+
+
+def _fwht128_quant_fp8_launch(
+    q: torch.Tensor,
+    weights: torch.Tensor | None,
+    wscale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    assert q.ndim == 2 and q.shape[1] == 128, q.shape
+    assert q.dtype == torch.bfloat16
+    assert q.is_contiguous()
+    n_rows = q.shape[0]
+    q_fp8 = torch.empty((n_rows, 128), dtype=torch.float8_e4m3fn, device=q.device)
+    q_scale = torch.empty((n_rows, 1), dtype=torch.float32, device=q.device)
+    w_out = None
+    if weights is not None:
+        assert weights.dtype == torch.float32 and weights.is_contiguous()
+        assert weights.numel() == n_rows, (weights.shape, n_rows)
+        w_out = torch.empty_like(weights)
+    if n_rows == 0:
+        return q_fp8, q_scale, w_out
+    BLOCK_R = 32
+    grid = (triton.cdiv(n_rows, BLOCK_R),)
+    _fwht_quant_kernel[grid](
+        q,
+        q_fp8,
+        q_scale,
+        # Unused when HAS_W is False.
+        weights if weights is not None else q_scale,
+        w_out if w_out is not None else q_scale,
+        n_rows,
+        wscale,
+        BLOCK_R=BLOCK_R,
+        HAS_W=weights is not None,
+        num_warps=2,
+    )
+    return q_fp8, q_scale, w_out
 
 
 def fwht128_quant_fp8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -120,18 +167,31 @@ def fwht128_quant_fp8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         (q_fp8 `[rows, 128]` float8_e4m3fn, scale `[rows, 1]` float32).
 
     """
-    assert q.ndim == 2 and q.shape[1] == 128, q.shape
-    assert q.dtype == torch.bfloat16
-    assert q.is_contiguous()
-    n_rows = q.shape[0]
-    q_fp8 = torch.empty((n_rows, 128), dtype=torch.float8_e4m3fn, device=q.device)
-    q_scale = torch.empty((n_rows, 1), dtype=torch.float32, device=q.device)
-    if n_rows == 0:
-        return q_fp8, q_scale
-    BLOCK_R = 32
-    grid = (triton.cdiv(n_rows, BLOCK_R),)
-    _fwht_quant_kernel[grid](q, q_fp8, q_scale, n_rows, BLOCK_R=BLOCK_R, num_warps=2)
+    q_fp8, q_scale, _ = _fwht128_quant_fp8_launch(q, None, 1.0)
     return q_fp8, q_scale
+
+
+def fwht128_quant_fp8_wscale(
+    q: torch.Tensor, weights: torch.Tensor, wscale: float
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """`fwht128_quant_fp8(q)` with the indexer head-gate scaling folded in.
+
+    Bit-identical to `fwht128_quant_fp8(q)` followed by
+    `(weights.unsqueeze(-1) * q_scale * wscale).squeeze(-1)`: same fp32 multiply
+    order, and `q_scale` is a power of two, so `weights * q_scale` is exact.
+
+    Args:
+        q: `[rows, 128]` bf16, row = token * n_head + head.
+        weights: `[rows // n_head, n_head]` fp32 head gate (same flat order).
+        wscale: softmax_scale * n_head**-0.5.
+
+    Returns:
+        (q_fp8 `[rows, 128]`, q_scale `[rows, 1]`, scaled weights like `weights`).
+
+    """
+    q_fp8, q_scale, w_out = _fwht128_quant_fp8_launch(q, weights, wscale)
+    assert w_out is not None
+    return q_fp8, q_scale, w_out
 
 
 # Fused pool compression and cache write.

@@ -712,6 +712,8 @@ def sparse_attn_indexer_kpool(
             # Decode seq_lens are pool-granular; recover token lengths from
             # positions using the padded [B, next_n] row layout when needed.
             if positions is not None:
+                # Positions as they are (int64): the expand kernel adds the 1
+                # and takes any int dtype, so no int32 copy and no +1 kernel.
                 dec_seq = _decode_topk_seq_lens(
                     positions,
                     decode_lens,
@@ -719,13 +721,18 @@ def sparse_attn_indexer_kpool(
                     batch_size,
                     next_n,
                     decode_metadata.requires_padding,
+                    add_one=False,
                 )
+                seq_len_offset = 1
             else:
                 dec_seq = decode_metadata.seq_lens[:n]
                 if dec_seq.ndim == 2:
                     dec_seq = dec_seq[:, -1]
                 dec_seq = dec_seq.to(torch.int32)
-            out = kpool_ops.expand_pools_and_append_tail(pool_ids, dec_seq, index_kpool)
+                seq_len_offset = 0
+            out = kpool_ops.expand_pools_and_append_tail(
+                pool_ids, dec_seq, index_kpool, seq_len_offset=seq_len_offset
+            )
         else:
             out = topk_dst
 
