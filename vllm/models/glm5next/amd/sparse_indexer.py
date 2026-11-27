@@ -13,6 +13,7 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.indexer_topk import get_indexer_topk
+from vllm.models.glm5next.amd.ops import hip as hip_ops
 from vllm.models.glm5next.amd.ops import kpool_compress as kpool_ops
 from vllm.models.glm5next.common.sparse_indexer import (
     RADIX_TOPK_WORKSPACE_SIZE,
@@ -99,6 +100,229 @@ def _kpool_compress_insert(
         round_scale=round_scale,
         write_cache=True,
         return_compressed=False,
+    )
+
+
+def _kpool_prefill_write(
+    kv_cache: torch.Tensor,
+    tail_kv_cache: torch.Tensor | None,
+    k: torch.Tensor,
+    gate_score: torch.Tensor,
+    ape: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    tail_slot_mapping: torch.Tensor | None,
+    kpool: int,
+    head_dim: int,
+    round_scale: bool,
+) -> None:
+    """Write the pools a prefill batch closes and, given `tail_slot_mapping`,
+    seed each request's tail ring with its incomplete pool."""
+    if hip_ops.kpool_compress_enabled():
+        if tail_slot_mapping is None:
+            hip_ops.kpool_compress_insert(
+                kv_cache, k, gate_score, ape, slot_mapping, kpool, round_scale
+            )
+        else:
+            assert tail_kv_cache is not None
+            hip_ops.kpool_insert_and_seed_tail(
+                kv_cache,
+                tail_kv_cache,
+                k,
+                gate_score,
+                ape,
+                slot_mapping,
+                tail_slot_mapping.to(slot_mapping.dtype),
+                kpool,
+                round_scale,
+            )
+        return
+    _kpool_compress_insert(
+        k, gate_score, ape, kv_cache, slot_mapping, kpool, head_dim, round_scale
+    )
+    if tail_slot_mapping is not None:
+        assert tail_kv_cache is not None
+        kpool_ops.kpool_seed_tail_cache(
+            tail_kv_cache, k, gate_score, tail_slot_mapping, kpool, head_dim
+        )
+
+
+def _kpool_decode_write(
+    kv_cache: torch.Tensor,
+    tail_kv_cache: torch.Tensor,
+    tail_slot_mapping: torch.Tensor,
+    key: torch.Tensor,
+    slot_score: torch.Tensor,
+    ape: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    positions: torch.Tensor,
+    kpool: int,
+    head_dim: int,
+    round_scale: bool,
+) -> None:
+    """Stash each decode token in its request's tail ring and write the pools
+    it closes. Inputs are grouped `[num_requests, next_n, ...]`."""
+    # The HIP kernel takes up to 16 tokens per request and one index dtype.
+    if hip_ops.kpool_compress_enabled() and key.shape[1] <= 16:
+        index_dtype = (
+            torch.int64
+            if torch.int64 in (tail_slot_mapping.dtype, slot_mapping.dtype)
+            or positions.dtype == torch.int64
+            else torch.int32
+        )
+        hip_ops.kpool_decode_update(
+            kv_cache,
+            tail_kv_cache,
+            tail_slot_mapping.to(index_dtype).contiguous(),
+            key,
+            slot_score,
+            ape,
+            slot_mapping.to(index_dtype).contiguous(),
+            positions.to(index_dtype).contiguous(),
+            kpool,
+            round_scale,
+        )
+        return
+    kpool_ops.kpool_decode_update_and_maybe_write_cache_batched(
+        kv_cache,
+        tail_kv_cache,
+        tail_slot_mapping,
+        key,
+        slot_score,
+        ape,
+        slot_mapping,
+        positions,
+        kpool,
+        head_dim,
+        round_scale=round_scale,
+    )
+
+
+def _hip_indexer_q_fits(q: torch.Tensor) -> bool:
+    return q.dtype == torch.float8_e4m3fn and q.shape[-2:] == (
+        hip_ops.INDEXER_HEADS,
+        hip_ops.INDEXER_HEAD_DIM,
+    )
+
+
+def _prefill_mqa_logits(
+    q: torch.Tensor,
+    k_quant: torch.Tensor,
+    k_scale: torch.Tensor,
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+) -> torch.Tensor:
+    if hip_ops.fp8_mqa_logits_enabled():
+        if _hip_indexer_q_fits(q):
+            return hip_ops.fp8_mqa_logits(
+                q, k_quant, k_scale, weights, cu_seqlen_ks, cu_seqlen_ke, False
+            )
+        hip_ops.decline(
+            "VLLM_ROCM_DSA_HIP_FP8_MQA_LOGITS",
+            f"the indexer query is {q.dtype} {list(q.shape[1:])}, not fp8 [32, 128]",
+        )
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import rocm_fp8_mqa_logits
+
+    return rocm_fp8_mqa_logits(
+        q, (k_quant, k_scale), weights, cu_seqlen_ks, cu_seqlen_ke
+    )
+
+
+def _prefill_top_k(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    topk_dst: torch.Tensor,
+    select_k: int,
+    index_kpool: int,
+) -> None:
+    num_rows = logits.shape[0]
+    if rocm_aiter_ops.is_indexer_top_k_supported(
+        is_prefill=True,
+        compress_ratio=index_kpool,
+        num_rows=num_rows,
+    ):
+        from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+            _launch_aiter_top_k_per_row_prefill,
+        )
+
+        _launch_aiter_top_k_per_row_prefill(
+            logits, row_starts, row_ends, topk_dst, select_k
+        )
+    else:
+        torch.ops._C.top_k_per_row_prefill(
+            logits,
+            row_starts,
+            row_ends,
+            topk_dst,
+            num_rows,
+            logits.stride(0),
+            logits.stride(1),
+            select_k,
+        )
+
+
+def _hip_fused_prefill_topk_fits(q: torch.Tensor, select_k: int) -> bool:
+    if not hip_ops.fp8_mqa_topk_enabled():
+        return False
+    reason = None
+    if not _hip_indexer_q_fits(q):
+        reason = f"the indexer query is {q.dtype} {list(q.shape[1:])}"
+    elif select_k > hip_ops.FUSED_TOPK_MAX_K:
+        reason = f"it selects {select_k} pools, the kernel at most 512"
+    elif torch.cuda.is_current_stream_capturing():
+        reason = "it sizes its grid on the host, so it cannot be captured"
+    if reason is not None:
+        hip_ops.decline("VLLM_ROCM_DSA_HIP_FP8_MQA_TOPK", reason)
+    return reason is None
+
+
+def _decode_paged_mqa_logits(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    schedule_metadata: torch.Tensor,
+    max_model_len: int,
+) -> torch.Tensor:
+    num_rows = q.shape[0] * q.shape[1]
+    if (
+        hip_ops.fp8_paged_mqa_logits_enabled()
+        and num_rows >= envs.VLLM_ROCM_DSA_HIP_FP8_PAGED_MQA_LOGITS_MIN_ROWS
+    ):
+        reason = None
+        if not _hip_indexer_q_fits(q):
+            reason = f"the indexer query is {q.dtype} {list(q.shape[2:])}"
+        elif kv_cache.shape[1] not in hip_ops.PAGED_LOGITS_BLOCK_SIZES:
+            reason = f"index pages hold {kv_cache.shape[1]} entries, not 1 or 64"
+        elif kv_cache.shape[-1] != hip_ops.INDEXER_HEAD_DIM + 4:
+            reason = f"index cache rows are {kv_cache.shape[-1]} bytes, not 132"
+        elif not kv_cache.is_contiguous():
+            reason = "the index cache is not contiguous"
+        if reason is None:
+            return hip_ops.fp8_paged_mqa_logits(
+                q,
+                kv_cache,
+                weights,
+                context_lens,
+                block_table,
+                max_model_len,
+                _decode_logits_workspace(num_rows, max_model_len),
+            )
+        hip_ops.decline("VLLM_ROCM_DSA_HIP_FP8_PAGED_MQA_LOGITS", reason)
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        rocm_fp8_paged_mqa_logits,
+    )
+
+    return rocm_fp8_paged_mqa_logits(
+        q,
+        kv_cache,
+        weights,
+        context_lens,
+        block_table,
+        schedule_metadata,
+        max_model_len=max_model_len,
     )
 
 
@@ -251,33 +475,29 @@ def sparse_attn_indexer_kpool(
             if n_prefill > 0:
                 # decode tokens are batched first; prefill tokens follow.
                 prefill_slice = slice(num_decode_tokens, num_tokens)
-                _kpool_compress_insert(
-                    k[prefill_slice],
-                    gate_score[prefill_slice],
-                    compress_ape,
-                    kv_cache,
-                    slot_mapping[prefill_slice],
-                    index_kpool,
-                    head_dim,
-                    round_scale=(scale_fmt is not None),
-                )
                 # Persist each request's incomplete prefill pool so decode can
                 # finish it, including after PD transfer. Tail slots use
                 # ``pos % kpool`` within the request's tail block. Processing
                 # only the batch's trailing tokens would miss all but the last
                 # request in a multi-request prefill.
+                tail_slot_mapping = None
                 if tail_kv_cache is not None and tail_prefix is not None:
                     tail_meta = attn_metadata.get(_resolve_layer_name(tail_prefix))
                     if tail_meta is not None:
                         assert isinstance(tail_meta, DeepseekV32IndexerMetadata)
-                        kpool_ops.kpool_seed_tail_cache(
-                            tail_kv_cache,
-                            k[prefill_slice],
-                            gate_score[prefill_slice],
-                            tail_meta.slot_mapping[prefill_slice],
-                            index_kpool,
-                            head_dim,
-                        )
+                        tail_slot_mapping = tail_meta.slot_mapping[prefill_slice]
+                _kpool_prefill_write(
+                    kv_cache,
+                    tail_kv_cache,
+                    k[prefill_slice],
+                    gate_score[prefill_slice],
+                    compress_ape,
+                    slot_mapping[prefill_slice],
+                    tail_slot_mapping,
+                    index_kpool,
+                    head_dim,
+                    round_scale=(scale_fmt is not None),
+                )
         else:
             # standard: per-token fp8 quant + scatter (all tokens).
             assert scale_fmt is not None
@@ -387,19 +607,9 @@ def sparse_attn_indexer_kpool(
                 q_slice_cast = q_slice
                 k_quant_cast = k_quant
                 k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
-            from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
-                rocm_fp8_mqa_logits,
-            )
-
             assert q_scale_slice is None
-            logits = rocm_fp8_mqa_logits(
-                q_slice_cast,
-                (k_quant_cast, k_scale_cast),
-                weights[chunk.token_start : chunk.token_end],
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
-            )
-            num_rows = logits.shape[0]
+            weights_slice = weights[chunk.token_start : chunk.token_end]
+            num_rows = q_slice_cast.shape[0]
 
             # kpool: logits are pool-granular (compress_ratio == index_kpool),
             # so topk selects pools. We pick topk_tokens // kpool pools then
@@ -407,7 +617,7 @@ def sparse_attn_indexer_kpool(
             select_k = topk_tokens // index_kpool if index_kpool > 1 else topk_tokens
             if index_kpool > 1:
                 pool_topk = torch.empty(
-                    (num_rows, select_k), dtype=torch.int32, device=logits.device
+                    (num_rows, select_k), dtype=torch.int32, device=q_slice.device
                 )
                 topk_dst = pool_topk
             else:
@@ -415,32 +625,32 @@ def sparse_attn_indexer_kpool(
                     chunk.token_start : chunk.token_end, :topk_tokens
                 ]
 
-            if rocm_aiter_ops.is_indexer_top_k_supported(
-                is_prefill=True,
-                compress_ratio=index_kpool,
-                num_rows=num_rows,
-            ):
-                from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
-                    _launch_aiter_top_k_per_row_prefill,
-                )
-
-                _launch_aiter_top_k_per_row_prefill(
-                    logits,
+            if index_kpool > 1 and _hip_fused_prefill_topk_fits(q_slice_cast, select_k):
+                hip_ops.fp8_mqa_topk(
+                    q_slice_cast,
+                    k_quant_cast,
+                    k_scale_cast,
+                    weights_slice,
                     chunk.cu_seqlen_ks,
                     chunk.cu_seqlen_ke,
-                    topk_dst,
-                    select_k,
+                    pool_topk,
                 )
             else:
-                torch.ops._C.top_k_per_row_prefill(
+                logits = _prefill_mqa_logits(
+                    q_slice_cast,
+                    k_quant_cast,
+                    k_scale_cast,
+                    weights_slice,
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                )
+                _prefill_top_k(
                     logits,
                     chunk.cu_seqlen_ks,
                     chunk.cu_seqlen_ke,
                     topk_dst,
-                    num_rows,
-                    logits.stride(0),
-                    logits.stride(1),
                     select_k,
+                    index_kpool,
                 )
 
             if index_kpool > 1:
@@ -569,6 +779,7 @@ def sparse_attn_indexer_kpool(
             # The compress kernel writes the raw fp8 cache (not the quant view);
             # pass the underlying kv_cache, not kv_cache_quant_view.
             if dec_tail_slot is not None:
+                assert tail_kv_cache is not None
                 # Single batched launch over [num_requests, next_n] replaces the
                 # per-token sequential loop. The kernel iterates each request's
                 # tokens in position order internally, preserving the
@@ -576,7 +787,7 @@ def sparse_attn_indexer_kpool(
                 # provided. Inputs are already grouped per request (uniform:
                 # view; non-uniform: _scatter_decode_tokens_by_request padded to
                 # [B, lmax]) — no per-token .contiguous() copies needed.
-                kpool_ops.kpool_decode_update_and_maybe_write_cache_batched(
+                _kpool_decode_write(
                     kv_cache_raw,
                     tail_kv_cache,
                     dec_tail_slot,
@@ -641,19 +852,15 @@ def sparse_attn_indexer_kpool(
             if use_fp4_cache
             else padded_q_quant_decode_tokens
         )
-        from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
-            rocm_fp8_paged_mqa_logits,
-        )
-
         assert padded_q_scale is None
-        logits = rocm_fp8_paged_mqa_logits(
+        logits = _decode_paged_mqa_logits(
             padded_q_quant_cast,
             kv_cache,
             padded_weights[:num_padded_tokens],
             seq_lens,
             decode_metadata.block_table,
             decode_metadata.schedule_metadata,
-            max_model_len=max_pool_len,
+            max_pool_len,
         )
         num_rows = logits.shape[0]
         # kpool: logits are pool-granular -> select topk_tokens//kpool pools,
@@ -790,6 +997,11 @@ class SparseAttnIndexerKpool(CustomOp):
         hf_config = model_config.hf_text_config if model_config is not None else None
         index_kpool = getattr(hf_config, "index_kpool", None) or 1
         if index_kpool > 1:
+            # Build the opted-in HIP kernels at load time, not in a forward.
+            hip_ops.kpool_compress_enabled()
+            hip_ops.fp8_mqa_logits_enabled()
+            hip_ops.fp8_mqa_topk_enabled()
+            hip_ops.fp8_paged_mqa_logits_enabled()
             kpool_ops.kpool_compress_dispatch.register_warmup(
                 k_cache=k_cache,
                 pool_size=index_kpool,

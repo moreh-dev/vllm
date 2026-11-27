@@ -258,7 +258,11 @@ class Glm5NextIndexerBackend(DeepseekV32IndexerBackend):
             # Platform block-size selection: no spec yet, under the current config.
             model_config = get_current_vllm_config().model_config
             index_kpool = model_config.hf_text_config.index_kpool
-        return [index_kpool * n for n in get_paged_mqa_page_sizes()]
+        page_sizes = get_paged_mqa_page_sizes()
+        if current_platform.is_rocm() and envs.VLLM_ROCM_DSA_HIP_FP8_PAGED_MQA_LOGITS:
+            # The in-tree HIP decode logits kernel reads 64-entry pages only.
+            page_sizes = (64,)
+        return [index_kpool * n for n in page_sizes]
 
 
 class KpoolTailBackend(DeepseekV32IndexerBackend):
