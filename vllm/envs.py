@@ -162,6 +162,12 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA: bool = False
     VLLM_ROCM_USE_AITER_FLYDSL_SPARSE_MLA: bool = False
     VLLM_ROCM_AITER_FLYDSL_SPARSE_MLA_MIN_TOKENS: int = 160
+    VLLM_ROCM_DSA_HIP_SPARSE_MLA_FP8: bool = False
+    VLLM_ROCM_DSA_KPOOL_HIP_COMPRESS: bool = False
+    VLLM_ROCM_DSA_HIP_FP8_MQA_LOGITS: bool = False
+    VLLM_ROCM_DSA_HIP_FP8_MQA_TOPK: bool = False
+    VLLM_ROCM_DSA_HIP_FP8_PAGED_MQA_LOGITS: bool = False
+    VLLM_ROCM_DSA_HIP_FP8_PAGED_MQA_LOGITS_MIN_ROWS: int = 16
     VLLM_ROCM_USE_AITER_TRITON_ROPE: bool = False
     VLLM_ROCM_USE_AITER_FP8BMM: bool = False
     VLLM_ROCM_USE_AITER_FP4BMM: bool = False
@@ -1452,6 +1458,42 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # there. 160 is the measured gfx950 crossover for 2048-key rows, H 8..16.
     "VLLM_ROCM_AITER_FLYDSL_SPARSE_MLA_MIN_TOKENS": lambda: int(
         os.getenv("VLLM_ROCM_AITER_FLYDSL_SPARSE_MLA_MIN_TOKENS", "160")
+    ),
+    # The GLM-5.3-Flash DSA kernels of ROCm/aiter (#6037, #7183/#8507, #8010,
+    # #7184, #7374), built in-tree on first use from
+    # models/glm5next/amd/ops/third_party/aiter. gfx950 only, all disabled by
+    # default; a call a kernel cannot take keeps the default path.
+    # Sparse MLA attention (ROCM_AITER_MLA_SPARSE) on the HIP FP8 kernel: needs
+    # all 64 heads on the rank (attention data parallelism), a 512-wide NoPE
+    # latent and an fp8 (e4m3) KV cache.
+    "VLLM_ROCM_DSA_HIP_SPARSE_MLA_FP8": lambda: (
+        os.getenv("VLLM_ROCM_DSA_HIP_SPARSE_MLA_FP8", "False").lower() in ("true", "1")
+    ),
+    # The kpool indexer's cache writers (prefill insert, tail seeding, decode
+    # update) on the HIP kernels, byte-identical to the Triton writers.
+    "VLLM_ROCM_DSA_KPOOL_HIP_COMPRESS": lambda: (
+        os.getenv("VLLM_ROCM_DSA_KPOOL_HIP_COMPRESS", "False").lower() in ("true", "1")
+    ),
+    # The kpool indexer's prefill logits on the HIP fp8_mqa_logits kernel.
+    "VLLM_ROCM_DSA_HIP_FP8_MQA_LOGITS": lambda: (
+        os.getenv("VLLM_ROCM_DSA_HIP_FP8_MQA_LOGITS", "False").lower() in ("true", "1")
+    ),
+    # The kpool indexer's prefill logits and pool top-k in one HIP kernel
+    # (fp8_mqa_topk) that never writes the fp32 logits.
+    "VLLM_ROCM_DSA_HIP_FP8_MQA_TOPK": lambda: (
+        os.getenv("VLLM_ROCM_DSA_HIP_FP8_MQA_TOPK", "False").lower() in ("true", "1")
+    ),
+    # The kpool indexer's decode logits on the HIP fp8_paged_mqa_logits kernel,
+    # for decode batches of at least
+    # VLLM_ROCM_DSA_HIP_FP8_PAGED_MQA_LOGITS_MIN_ROWS query rows. The kernel
+    # reads 64-entry index pages, so this makes the KV cache use
+    # 64 * index_kpool-token blocks (256 for GLM-5.3-Flash).
+    "VLLM_ROCM_DSA_HIP_FP8_PAGED_MQA_LOGITS": lambda: (
+        os.getenv("VLLM_ROCM_DSA_HIP_FP8_PAGED_MQA_LOGITS", "False").lower()
+        in ("true", "1")
+    ),
+    "VLLM_ROCM_DSA_HIP_FP8_PAGED_MQA_LOGITS_MIN_ROWS": lambda: int(
+        os.getenv("VLLM_ROCM_DSA_HIP_FP8_PAGED_MQA_LOGITS_MIN_ROWS", "16")
     ),
     # Whether to use aiter rope.
     # By default is disabled.

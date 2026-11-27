@@ -1644,6 +1644,12 @@ package_data = {
         "distributed/kv_transfer/kv_connector/v1/hf3fs/utils/*.cpp",
         # Inkling2 TRT-LLM-gen expert GEMM binding (FlashInfer JIT)
         "models/inkling2/nvidia/ops/*.cu",
+        # GLM-5.3-Flash gfx950 DSA kernels from AITER, built on first use
+        "models/glm5next/amd/ops/hip/csrc/*",
+        "models/glm5next/amd/ops/third_party/aiter/LICENSE",
+        "models/glm5next/amd/ops/third_party/aiter/csrc/**/*.cu",
+        "models/glm5next/amd/ops/third_party/aiter/csrc/**/*.cuh",
+        "models/glm5next/amd/ops/third_party/aiter/csrc/**/*.h",
         # Built-in multimodal chat template fallbacks (registry.py)
         "transformers_utils/chat_templates/*.jinja",
         "third_party/flash_linear_attention/LICENSE",
