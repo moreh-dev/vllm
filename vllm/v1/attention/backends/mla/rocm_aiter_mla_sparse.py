@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, ClassVar, cast
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -36,6 +37,9 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
     align_blocks_to_rows,
     flat_kv_row_view,
     triton_filter_and_convert_dcp_index,
+)
+from vllm.v1.attention.backends.mla.sparse_utils import (
+    triton_convert_req_index_to_global_index as dense_req_index_to_global_index,
 )
 from vllm.v1.attention.ops.mxfp4_mla import row_bytes as mxfp4_row_bytes
 from vllm.v1.attention.ops.mxfp4_mla.store import store_mxfp4_mla
@@ -638,6 +642,12 @@ class ROCMAiterMLASparseMetadata(SparseMLACommonMetadata):
     remapped_buf: object = None
     remapped_epoch: int = -1
 
+    # Dense [num_tokens, topk] cache slots (-1 when invalid) of the HIP FP8
+    # sparse MLA path, with their source buffer and index_epoch.
+    hip_kv_indices: torch.Tensor | None = None
+    hip_remapped_buf: object = None
+    hip_remapped_epoch: int = -1
+
     # Persistent MLA metadata (only populated when persistent mode is enabled,
     # i.e. when the aiter sparse decode kernel supports work-stealing splits).
     work_meta_data: torch.Tensor | None = None
@@ -1036,6 +1046,7 @@ class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
     supports_dcp = True
     can_return_lse_for_decode = True
     use_aiter_sparse_mla = False
+    use_hip_sparse_mla_fp8 = False
 
     def __init__(
         self,
@@ -1160,6 +1171,14 @@ class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
                 AITER_SPARSE_MLA_HEAD_TILE,
             )
             self.use_shardq = False
+        if envs.VLLM_ROCM_DSA_HIP_SPARSE_MLA_FP8:
+            from vllm.models.glm5next.amd.ops import hip as hip_ops
+
+            reason = self._hip_sparse_mla_unsupported_reason(vllm_config)
+            if reason is not None:
+                hip_ops.decline("VLLM_ROCM_DSA_HIP_SPARSE_MLA_FP8", reason)
+            elif hip_ops.sparse_mla_fp8_enabled():
+                self.use_hip_sparse_mla_fp8 = True
 
     def _attn_sink(self, q: torch.Tensor) -> torch.Tensor | None:
         """Returns the sinks for the heads of `q`."""
@@ -1177,6 +1196,34 @@ class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
         # Context parallelism merges each rank's partials with a per-token LSE.
         if self.dcp_world_size > 1 or self.pcp_world_size > 1:
             return "context parallelism is not supported"
+        return None
+
+    def _hip_sparse_mla_unsupported_reason(self, vllm_config: VllmConfig) -> str | None:
+        from vllm.models.glm5next.amd.ops import hip as hip_ops
+
+        if self.num_heads != hip_ops.SPARSE_MLA_HEADS:
+            return (
+                f"{self.num_heads} attention heads on this rank, the kernel needs "
+                f"{hip_ops.SPARSE_MLA_HEADS} (attention data parallelism)"
+            )
+        if (
+            self.kv_lora_rank != hip_ops.SPARSE_MLA_HEAD_DIM
+            or self.qk_rope_head_dim != 0
+        ):
+            return (
+                f"the cached latent is {self.kv_lora_rank} wide with "
+                f"{self.qk_rope_head_dim} RoPE dims, the kernel needs 512 and none"
+            )
+        if self.kv_cache_dtype not in ("fp8", "fp8_e4m3"):
+            return f"kv-cache dtype {self.kv_cache_dtype!r} is not fp8 (e4m3)"
+        if self.sinks is not None:
+            return "attention sinks are not supported"
+        if self.dcp_world_size > 1 or self.pcp_world_size > 1:
+            return "context parallelism is not supported"
+        if self.use_shardq:
+            return "ShardQ is not supported"
+        if vllm_config.model_config.dtype != torch.bfloat16:
+            return f"the model dtype is {vllm_config.model_config.dtype}, not bf16"
         return None
 
     def do_kv_cache_update(
@@ -1493,6 +1540,73 @@ class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
         )
         return output
 
+    @staticmethod
+    def _hip_takes_batch(num_tokens: int) -> bool:
+        from vllm.models.glm5next.amd.ops import hip as hip_ops
+
+        if num_tokens <= hip_ops.SPARSE_MLA_MAX_QUERIES:
+            return True
+        hip_ops.decline(
+            "VLLM_ROCM_DSA_HIP_SPARSE_MLA_FP8",
+            f"a batch above {hip_ops.SPARSE_MLA_MAX_QUERIES} tokens exceeds the kernel",
+        )
+        return False
+
+    def _forward_mla_hip(
+        self,
+        layer: AttentionLayer,
+        q: torch.Tensor,  # [sq, 64, 512] fp8 or bf16
+        kv_rows: torch.Tensor,  # flat fp8 [rows, 512]
+        block_stride_rows: int,
+        attn_metadata: ROCMAiterMLASparseMetadata,
+    ) -> torch.Tensor:
+        """_forward_mla on the in-tree HIP FP8 sparse MLA kernel (ROCm/aiter
+        #6037), which reads dense per-token slot rows with -1 for invalid
+        entries instead of the ragged stream."""
+        from vllm.models.glm5next.amd.ops import hip as hip_ops
+
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        if (
+            self.owns_indexer
+            or attn_metadata.hip_remapped_epoch != self.index_epoch
+            or attn_metadata.hip_remapped_buf is not self.topk_indices_buffer
+        ):
+            assert self.topk_indices_buffer is not None
+            topk_start = attn_metadata.topk_start
+            token_indices = fit_kpool_indices_to_aiter(
+                self.topk_indices_buffer[topk_start : topk_start + num_actual_tokens],
+                attn_metadata.topk_tokens,
+            )
+            attn_metadata.hip_kv_indices = cast(
+                torch.Tensor,
+                dense_req_index_to_global_index(
+                    attn_metadata.req_id_per_token[:num_actual_tokens],
+                    attn_metadata.block_table,
+                    token_indices,
+                    BLOCK_SIZE=attn_metadata.block_size,
+                    BLOCK_STRIDE_ROWS=block_stride_rows,
+                    NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
+                ),
+            )
+            attn_metadata.hip_remapped_buf = self.topk_indices_buffer
+            attn_metadata.hip_remapped_epoch = self.index_epoch
+        assert attn_metadata.hip_kv_indices is not None
+        output = torch.empty(
+            [q.shape[0], q.shape[1], self.kv_lora_rank],
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+        hip_ops.sparse_mla_fp8_fwd(
+            q[:num_actual_tokens],
+            kv_rows,
+            attn_metadata.hip_kv_indices,
+            self.scale,
+            q_scale=layer._q_scale_float,
+            kv_scale=layer._k_scale_float,
+            out=output[:num_actual_tokens],
+        )
+        return output
+
     def forward_mqa(
         self,
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
@@ -1603,9 +1717,12 @@ class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
             )
             return output, lse
 
+        use_hip_sparse_mla = self.use_hip_sparse_mla_fp8 and self._hip_takes_batch(
+            attn_metadata.num_actual_tokens
+        )
         # Indexer layers may rewrite their buffer, so always remap. Non-indexer
         # layers have their own KV cache group: remap once per indexer write.
-        if (
+        if not use_hip_sparse_mla and (
             self.owns_indexer
             or attn_metadata.remapped_epoch != self.index_epoch
             or attn_metadata.remapped_buf is not self.topk_indices_buffer
@@ -1672,6 +1789,11 @@ class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
                 original_q_shape = q.shape
                 q, _ = ops.scaled_fp8_quant(q.view(q.shape[0], -1), layer._q_scale)
                 q = q.view(original_q_shape)
+        if use_hip_sparse_mla:
+            output = self._forward_mla_hip(
+                layer, q, kv_c_and_k_pe_cache, block_stride_rows, attn_metadata
+            )
+            return output, None
         if self.use_aiter_sparse_mla:
             output = self._forward_mla_aiter(
                 layer, q, kv_c_and_k_pe_cache, attn_metadata
